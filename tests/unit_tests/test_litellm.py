@@ -1,29 +1,64 @@
 """Test chat model integration."""
 
 # stdlib
+import asyncio
+import json
 import logging
-from typing import Any, Dict, Optional, Union
-from unittest.mock import patch
+import re
+import subprocess
+import sys
+import warnings
+from collections import OrderedDict, defaultdict
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, patch
 
 # third-party
+import httpx
 import litellm
 import pytest
+from langchain.chat_models import init_chat_model
+from langchain_core.caches import InMemoryCache
 from langchain_core.exceptions import OutputParserException
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    ChatMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.runnables import RunnableLambda
+from langchain_core.tools import Tool
 from litellm.types.utils import ChatCompletionDeltaToolCall, Delta, Function
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 # first-party
 from langchain_litellm._version import __version__
-from langchain_litellm.chat_models import ChatLiteLLM
+from langchain_litellm.chat_models import ChatLiteLLM, ChatLiteLLMRouter
 from langchain_litellm.chat_models.litellm import (
     _collapse_text_only_content,
     _convert_delta_to_message_chunk,
     _convert_dict_to_message,
     _convert_message_to_dict,
+    _cost_metadata,
     _create_usage_metadata,
-    _inject_reasoning_content_into_content,
+    _provider_api_key_field,
+    _stream_cost_metadata,
+)
+from tests.utils import (
+    OPUS_4_7_THINKS_ADAPTIVELY,
+    chat_completion_events,
+    chat_completion_reply,
+    function_call_item,
+    gemini_reply,
+    make_router,
+    message_item,
+    reasoning_item,
+    responses_api_events,
+    responses_api_reply,
+    serve_http,
+    whole_reply,
 )
 
 
@@ -77,6 +112,616 @@ def test_convert_dict_to_tool_message() -> None:
     assert isinstance(message, ToolMessage)
     assert message.content == "result"
     assert message.tool_call_id == "123"
+
+
+@pytest.mark.parametrize(
+    ("summaries", "expected"),
+    [
+        (["Think A.", "Think B."], "Think A.Think B."),
+        (["Think A. ", " Think B."], "Think A.  Think B."),
+        (["", "Think B."], "Think B."),
+        ([], "SDK fallback"),
+    ],
+)
+def test_reasoning_summaries_preserve_provider_whitespace(
+    summaries: list[str], expected: str
+) -> None:
+    items = [
+        {
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "sealed",
+            "summary": [{"type": "summary_text", "text": text} for text in summaries],
+        }
+    ]
+    message = _convert_dict_to_message(
+        {
+            "role": "assistant",
+            "content": "Reply",
+            "reasoning_content": "SDK fallback",
+            "reasoning_items": items,
+        }
+    )
+
+    assert message.additional_kwargs["reasoning_content"] == expected
+    assert message.additional_kwargs["reasoning_items"] == items
+
+
+def test_malformed_tool_call_arguments_are_reported_as_invalid() -> None:
+    """Unparsable arguments must not become a tool call with empty args.
+
+    A truncated `arguments` string cannot be recovered. Returning it as a valid
+    tool call with `args={}` makes an agent invoke the tool with no input and
+    leaves it no way to detect the failure, so the call belongs in
+    `invalid_tool_calls` with the raw string kept for inspection.
+    """
+    raw_arguments = '{"city": "Par'
+    message = _convert_dict_to_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": raw_arguments},
+                }
+            ],
+        }
+    )
+
+    assert isinstance(message, AIMessage)
+    assert message.tool_calls == []
+    assert len(message.invalid_tool_calls) == 1
+
+    invalid = message.invalid_tool_calls[0]
+    assert invalid["name"] == "get_weather"
+    assert invalid["args"] == raw_arguments
+    assert invalid["id"] == "call_1"
+
+
+def test_unparsable_tool_calls_are_not_echoed_back() -> None:
+    """A call that never parsed was never dispatched, so nothing can answer it.
+
+    Sending the raw arguments back makes the provider fail the same parse, which
+    breaks the recovery turn that reporting the call as invalid exists to enable.
+    """
+    message = _convert_dict_to_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "bad",
+                    "type": "function",
+                    "function": {"name": "broken", "arguments": '{"city": "Par'},
+                }
+            ],
+        }
+    )
+
+    assert "tool_calls" not in _convert_message_to_dict(message)
+
+
+def test_valid_tool_calls_survive_an_invalid_sibling_in_the_request() -> None:
+    """Dropping the unparsable call must not drop the ones that did parse."""
+    message = _convert_dict_to_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "ok",
+                    "type": "function",
+                    "function": {"name": "with_args", "arguments": '{"x": 1}'},
+                },
+                {
+                    "id": "bad",
+                    "type": "function",
+                    "function": {"name": "broken", "arguments": "{oops"},
+                },
+            ],
+        }
+    )
+
+    sent = _convert_message_to_dict(message)["tool_calls"]
+    assert [tc["function"]["name"] for tc in sent] == ["with_args"]
+
+
+def test_tool_calls_partition_valid_and_invalid_arguments() -> None:
+    """Valid calls in the same response are unaffected by an invalid sibling."""
+    message = _convert_dict_to_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "ok",
+                    "type": "function",
+                    "function": {"name": "with_args", "arguments": '{"x": 1}'},
+                },
+                {
+                    "id": "bad",
+                    "type": "function",
+                    "function": {"name": "broken", "arguments": "{oops"},
+                },
+                {
+                    "id": "empty",
+                    "type": "function",
+                    "function": {"name": "no_args", "arguments": "{}"},
+                },
+            ],
+        }
+    )
+
+    assert isinstance(message, AIMessage)
+    assert [tc["name"] for tc in message.tool_calls] == ["with_args", "no_args"]
+    assert message.tool_calls[0]["args"] == {"x": 1}
+    assert message.tool_calls[1]["args"] == {}
+    assert [tc["name"] for tc in message.invalid_tool_calls] == ["broken"]
+
+
+@pytest.fixture
+def _no_provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep key resolution independent of the developer's own environment."""
+    for var in (
+        "OPENAI_API_KEY",
+        "AZURE_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "REPLICATE_API_KEY",
+        "OPENROUTER_API_KEY",
+        "COHERE_API_KEY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_provider_specific_api_key_is_forwarded(_no_provider_env: None) -> None:
+    """A key passed as `openai_api_key` must reach litellm.
+
+    Only the generic `api_key` was forwarded, so a provider-specific key was
+    accepted, stored, and then dropped before the request.
+    """
+    llm = ChatLiteLLM(model="gpt-4o", openai_api_key="sk-openai")
+    assert llm._client_params["api_key"] == "sk-openai"
+
+
+def test_explicit_api_key_takes_precedence(_no_provider_env: None) -> None:
+    """`api_key` still wins when both are supplied."""
+    llm = ChatLiteLLM(model="gpt-4o", api_key="sk-explicit", openai_api_key="sk-openai")
+    assert llm._client_params["api_key"] == "sk-explicit"
+
+
+def test_provider_specific_api_key_not_used_for_other_provider(
+    _no_provider_env: None,
+) -> None:
+    """A key is only forwarded to the provider it belongs to."""
+    llm = ChatLiteLLM(
+        model="openrouter/meta-llama/llama-3-8b-instruct",
+        openai_api_key="sk-openai",
+    )
+    assert llm._client_params.get("api_key") is None
+
+
+def test_custom_llm_provider_selects_the_api_key(_no_provider_env: None) -> None:
+    """An explicit `custom_llm_provider` decides which field is used."""
+    llm = ChatLiteLLM(
+        model="my-proxy-deployment",
+        custom_llm_provider="anthropic",
+        anthropic_api_key="sk-anthropic",
+    )
+    assert llm._client_params["api_key"] == "sk-anthropic"
+
+
+_MOCK_OK = {
+    "choices": [
+        {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+    ],
+    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+}
+
+
+def test_per_call_model_override_does_not_reuse_the_other_providers_key(
+    _no_provider_env: None,
+) -> None:
+    """A per-call `model` override must re-resolve the key it travels with.
+
+    `_client_params` resolves the key from the constructor's model, but the four
+    entry points merge per-call kwargs over it afterwards. Without re-resolving,
+    the OpenAI key would be sent as the credential for an Anthropic model.
+
+    Asserted at the litellm boundary rather than on `_client_params`, which is
+    evaluated before the override and so cannot observe this.
+    """
+    llm = ChatLiteLLM(model="gpt-4o", openai_api_key="sk-openai")
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi", model="anthropic/claude-3-5-sonnet-20241022")
+
+    kwargs = mock_completion.call_args.kwargs
+    assert kwargs["model"] == "anthropic/claude-3-5-sonnet-20241022"
+    assert kwargs["api_key"] != "sk-openai"
+    assert kwargs["api_key"] is None
+
+
+def test_per_call_model_override_selects_that_providers_key(
+    _no_provider_env: None,
+) -> None:
+    """The override picks the field belonging to the model actually being called."""
+    llm = ChatLiteLLM(
+        model="gpt-4o", openai_api_key="sk-openai", anthropic_api_key="sk-anthropic"
+    )
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi", model="anthropic/claude-3-5-sonnet-20241022")
+
+    assert mock_completion.call_args.kwargs["api_key"] == "sk-anthropic"
+
+
+@pytest.mark.parametrize(
+    ("provider", "field"),
+    [("huggingface", "huggingface_api_key"), ("together_ai", "together_ai_api_key")],
+)
+def test_late_declared_provider_keys_reach_litellm(
+    _no_provider_env: None, provider: str, field: str
+) -> None:
+    """These two had no field, so pydantic discarded whatever the caller passed."""
+    kwargs: dict[str, Any] = {"model": f"{provider}/some-model", field: "sk-late"}
+    llm = ChatLiteLLM(**kwargs)  # type: ignore[arg-type]
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi")
+
+    assert mock_completion.call_args.kwargs["api_key"] == "sk-late"
+
+
+def test_an_ambient_env_key_is_not_sent_as_a_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """litellm resolves the environment itself, and an explicit key overrides it.
+
+    Passing back a value read from the environment beats `litellm.api_key` and the
+    other module globals, so configuring litellm programmatically stops working.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-ambient")
+    llm = ChatLiteLLM(model="gpt-4o")
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi")
+
+    assert mock_completion.call_args.kwargs.get("api_key") is None
+
+
+def test_an_ambient_env_key_does_not_follow_a_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pinned gateway holds the credential steady, so it must hold a real one.
+
+    Freezing a key the caller never supplied sends an OpenAI environment key to an
+    arbitrary endpoint as the credential for an Anthropic model.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-ambient")
+    llm = ChatLiteLLM(model="gpt-4o", api_base="https://gateway.internal/v1")
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi", model="anthropic/claude-3-5-sonnet-20241022")
+
+    kwargs = mock_completion.call_args.kwargs
+    assert kwargs.get("api_key") is None
+    assert kwargs["api_base"] == "https://gateway.internal/v1"
+
+
+def test_no_provider_key_configured_skips_the_registry_lookup(
+    _no_provider_env: None,
+) -> None:
+    """litellm prints a banner to stdout for every model it cannot attribute.
+
+    With no provider-scoped key set there is nothing to attribute, so a proxy
+    deployment name must not cost a lookup and that banner on every request.
+    """
+    llm = ChatLiteLLM(model="my-deployment")
+
+    with (
+        patch.object(litellm, "get_llm_provider") as mock_lookup,
+        patch.object(llm.client, "completion", return_value=_MOCK_OK),
+    ):
+        llm.invoke("hi", custom_llm_provider="openai")
+
+    mock_lookup.assert_not_called()
+
+
+def test_a_subclass_provider_key_field_is_forwarded(_no_provider_env: None) -> None:
+    """Resolution reads the runtime class, so a subclass can add a provider.
+
+    Pinning the base class drops a field the subclass declares and accepts, which
+    is the silent discard this resolution exists to stop.
+    """
+
+    class _DeepSeekChat(ChatLiteLLM):
+        deepseek_api_key: str | None = None
+
+    llm = _DeepSeekChat(model="deepseek/deepseek-chat", deepseek_api_key="sk-deepseek")
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi")
+
+    assert mock_completion.call_args.kwargs["api_key"] == "sk-deepseek"
+
+
+def test_an_unexpected_provider_lookup_error_surfaces(_no_provider_env: None) -> None:
+    """Only litellm's own "cannot attribute this model" is a reason to give up.
+
+    Swallowing anything else silently stops forwarding the key, reproducing the bug
+    this resolution fixes with no signal that it happened.
+    """
+    llm = ChatLiteLLM(model="gpt-4o", openai_api_key="sk-openai")
+
+    with (
+        patch.object(
+            litellm, "get_llm_provider", side_effect=TypeError("signature changed")
+        ),
+        pytest.raises(TypeError),
+    ):
+        _ = llm._client_params
+
+
+def test_model_kwargs_decides_the_timeout(_no_provider_env: None) -> None:
+    """`model_kwargs` is merged last, so it decides every parameter it names.
+
+    `timeout` used to be the one exception, overwritten by `request_timeout` after
+    the merge.
+    """
+    llm = ChatLiteLLM(model="gpt-4o", request_timeout=7, model_kwargs={"timeout": 42})
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi")
+
+    assert mock_completion.call_args.kwargs["timeout"] == 42
+
+
+def test_redirect_re_resolves_only_the_inferred_credential(
+    _no_provider_env: None,
+) -> None:
+    """Only the provider-scoped key is inferred from the destination.
+
+    `api_base`, `organization` and `extra_headers` exist because a caller set them,
+    so a redirect must not discard that intent. Without an `api_base` pinned, the
+    key is the one thing derived from where the request goes, so it re-resolves.
+    """
+    llm = ChatLiteLLM(
+        model="gpt-4o",
+        openai_api_key="sk-openai",
+        anthropic_api_key="sk-anthropic",
+        organization="org-openai",
+        extra_headers={"X-Team": "platform"},
+    )
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi", model="anthropic/claude-3-5-sonnet-20241022")
+
+    kwargs = mock_completion.call_args.kwargs
+    assert kwargs["api_key"] == "sk-anthropic"
+    assert kwargs["organization"] == "org-openai"
+    assert kwargs["extra_headers"] == {"X-Team": "platform"}
+
+
+def test_base_model_survives_a_redirect(_no_provider_env: None) -> None:
+    """`base_model` is caller configuration, not something inferred from the model.
+
+    It drives cost attribution for deployments litellm's cost map does not know, so
+    dropping it on a redirect would silently misattribute spend.
+    """
+    llm = ChatLiteLLM(model="gpt-4o", openai_api_key="sk-openai", base_model="gpt-4o")
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi", model="anthropic/claude-3-5-sonnet-20241022")
+
+    assert mock_completion.call_args.kwargs["base_model"] == "gpt-4o"
+
+
+def test_a_pinned_api_base_keeps_its_credential_across_a_redirect(
+    _no_provider_env: None,
+) -> None:
+    """A pinned endpoint is one gateway serving many models on one credential.
+
+    Swapping in a provider-scoped key would send the wrong credential to that
+    gateway, and dropping the endpoint would ignore the caller's explicit choice.
+    """
+    llm = ChatLiteLLM(
+        model="gpt-4o",
+        openai_api_key="sk-openai",
+        anthropic_api_key="sk-anthropic",
+        api_base="https://gateway.internal/v1",
+    )
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi", model="anthropic/claude-3-5-sonnet-20241022")
+
+    kwargs = mock_completion.call_args.kwargs
+    assert kwargs["api_base"] == "https://gateway.internal/v1"
+    assert kwargs["api_key"] == "sk-openai"
+
+
+def test_caller_supplied_destination_params_survive_a_redirect(
+    _no_provider_env: None,
+) -> None:
+    """A caller who wants an endpoint at the new destination passes it per call."""
+    llm = ChatLiteLLM(
+        model="gpt-4o", openai_api_key="sk-openai", api_base="https://old/v1"
+    )
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke(
+            "hi",
+            model="anthropic/claude-3-5-sonnet-20241022",
+            api_base="https://new/v1",
+        )
+
+    assert mock_completion.call_args.kwargs["api_base"] == "https://new/v1"
+
+
+def test_no_redirect_keeps_the_configured_destination(_no_provider_env: None) -> None:
+    """Without a redirect nothing is dropped."""
+    llm = ChatLiteLLM(
+        model="gpt-4o", openai_api_key="sk-openai", api_base="https://proxy/v1"
+    )
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi")
+
+    assert mock_completion.call_args.kwargs["api_base"] == "https://proxy/v1"
+
+
+def test_none_override_is_treated_as_omitted(_no_provider_env: None) -> None:
+    """`model=None` must fall back rather than sending a null destination."""
+    llm = ChatLiteLLM(model="gpt-4o", openai_api_key="sk-openai")
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi", model=None, custom_llm_provider=None)
+
+    kwargs = mock_completion.call_args.kwargs
+    assert kwargs["model"] == "gpt-4o"
+    assert kwargs["api_key"] == "sk-openai"
+
+
+def test_model_kwargs_destination_decides_the_key(_no_provider_env: None) -> None:
+    """`model_kwargs` is merged last, so an entry there is the real destination."""
+    llm = ChatLiteLLM(
+        model="gpt-4o",
+        openai_api_key="sk-openai",
+        anthropic_api_key="sk-anthropic",
+        model_kwargs={"model": "anthropic/claude-3-5-sonnet-20241022"},
+    )
+    assert llm._client_params["api_key"] == "sk-anthropic"
+
+
+def test_model_kwargs_api_key_survives_a_redirect(_no_provider_env: None) -> None:
+    """A generic key is provider-agnostic wherever it was supplied.
+
+    `model_kwargs["api_key"]` reaches litellm like the field does, so a redirect must
+    not replace it with a provider-scoped resolution.
+    """
+    llm = ChatLiteLLM(
+        model="gpt-4o",
+        anthropic_api_key="sk-anthropic",
+        model_kwargs={"api_key": "sk-generic"},
+    )
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi", model="anthropic/claude-3-5-sonnet-20241022")
+
+    assert mock_completion.call_args.kwargs["api_key"] == "sk-generic"
+
+
+def test_model_kwargs_credentials_are_not_clobbered(_no_provider_env: None) -> None:
+    """An unset field must not overwrite the same key supplied via model_kwargs."""
+    llm = ChatLiteLLM(
+        model="gpt-4o",
+        openai_api_key="sk-openai",
+        model_kwargs={"api_base": "https://from-model-kwargs/v1"},
+    )
+    assert llm._client_params["api_base"] == "https://from-model-kwargs/v1"
+
+
+def test_provider_api_key_field_is_derived_from_declared_fields() -> None:
+    """The mapping follows the `<provider>_api_key` convention, with aliases named."""
+    assert _provider_api_key_field(ChatLiteLLM, "anthropic") == "anthropic_api_key"
+    assert _provider_api_key_field(ChatLiteLLM, "cohere_chat") == "cohere_api_key"
+    assert (
+        _provider_api_key_field(ChatLiteLLM, "text-completion-openai")
+        == "openai_api_key"
+    )
+    # No declared field, so no key is guessed.
+    assert _provider_api_key_field(ChatLiteLLM, "bedrock") is None
+    assert _provider_api_key_field(ChatLiteLLM, None) is None
+
+
+def test_per_call_custom_llm_provider_does_not_reuse_the_other_providers_key(
+    _no_provider_env: None,
+) -> None:
+    """`custom_llm_provider` is the other per-call route to the destination.
+
+    It decides where litellm sends the request just as `model` does, so a key
+    resolved from the constructor's provider must not travel with it.
+    """
+    llm = ChatLiteLLM(model="gpt-4o", openai_api_key="sk-openai")
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi", custom_llm_provider="anthropic")
+
+    kwargs = mock_completion.call_args.kwargs
+    assert kwargs["custom_llm_provider"] == "anthropic"
+    assert kwargs["api_key"] != "sk-openai"
+    assert kwargs["api_key"] is None
+
+
+def test_per_call_custom_llm_provider_selects_that_providers_key(
+    _no_provider_env: None,
+) -> None:
+    """The per-call provider picks its own field, even for a model litellm cannot attribute."""
+    llm = ChatLiteLLM(
+        model="totally-made-up-model",
+        openai_api_key="sk-openai",
+        anthropic_api_key="sk-anthropic",
+    )
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi", custom_llm_provider="anthropic")
+
+    assert mock_completion.call_args.kwargs["api_key"] == "sk-anthropic"
+
+
+def test_explicit_per_call_api_key_survives_a_model_override(
+    _no_provider_env: None,
+) -> None:
+    """An `api_key` passed per call still wins over any resolution."""
+    llm = ChatLiteLLM(model="gpt-4o", openai_api_key="sk-openai")
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke(
+            "hi", model="anthropic/claude-3-5-sonnet-20241022", api_key="sk-explicit"
+        )
+
+    assert mock_completion.call_args.kwargs["api_key"] == "sk-explicit"
+
+
+def test_unattributable_model_leaves_api_key_unset(_no_provider_env: None) -> None:
+    """Models litellm cannot attribute fall back to the previous behaviour."""
+    llm = ChatLiteLLM(model="totally-made-up-model", openai_api_key="sk-openai")
+    assert llm._client_params.get("api_key") is None
 
 
 def test_provider_specific_fields_in_delta() -> None:
@@ -144,6 +789,486 @@ def test_provider_specific_fields_in_chat_result() -> None:
         result.llm_output["provider_specific_fields"]["citations"][0]["source"]
         == "test"
     )
+
+
+# ── replies litellm splits across choices ──────────────────────────────────────
+
+# `<provider>/responses/<model>` makes litellm answer through its Responses API bridge.
+_BRIDGED_MODEL = "openai/responses/gpt-4o-mini"
+
+
+@pytest.mark.parametrize("method", ["invoke", "ainvoke"])
+@pytest.mark.asyncio
+async def test_a_split_reply_keeps_its_tool_calls(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """litellm's Responses API bridge gives text and tool calls a choice each.
+
+    They are one reply, and a caller acting on it needs the calls.
+    """
+    requests = serve_http(
+        monkeypatch,
+        responses_api_reply(
+            message_item("Let me check."),
+            function_call_item("call_1", '{"city": "Paris"}'),
+        ),
+    )
+    llm = ChatLiteLLM(model=_BRIDGED_MODEL, api_key="k")
+
+    if method == "invoke":
+        message = llm.invoke("weather?")
+    else:
+        message = await llm.ainvoke("weather?")
+
+    assert requests[0].url.path.endswith("/responses")
+    assert message.content == "Let me check."
+    assert [
+        (call["name"], call["args"], call["id"]) for call in message.tool_calls
+    ] == [("get_weather", {"city": "Paris"}, "call_1")]
+    assert message.response_metadata["finish_reason"] == "tool_calls"
+    assert message.response_metadata["id"] == "resp_1"
+
+
+@pytest.mark.parametrize("method", ["invoke", "ainvoke"])
+@pytest.mark.asyncio
+async def test_use_previous_response_id_trims_history_and_reaches_responses_api(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """The server continues from its reply, so only the new turn is sent."""
+    requests = serve_http(monkeypatch, responses_api_reply(message_item("Fine.")))
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="k", use_previous_response_id=True)
+    history = [
+        HumanMessage("Hello"),
+        AIMessage("Hi.", response_metadata={"id": "resp_previous"}),
+        HumanMessage("How are you?"),
+    ]
+
+    if method == "invoke":
+        message = llm.invoke(history)
+    else:
+        message = await llm.ainvoke(history)
+
+    payload = json.loads(requests[0].content)
+    assert requests[0].url.path.endswith("/responses")
+    assert payload["previous_response_id"] == "resp_previous"
+    assert payload["input"] == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "How are you?"}],
+        }
+    ]
+    assert message.response_metadata["id"] == "resp_1"
+
+
+@pytest.mark.parametrize("method", ["stream", "astream"])
+@pytest.mark.asyncio
+async def test_use_previous_response_id_streams_and_chains(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """The Responses API bridge retains its id after either kind of stream."""
+    reply = responses_api_reply(message_item("Fine."))
+    requests = serve_http(
+        monkeypatch,
+        reply,
+        responses_api_events(
+            {
+                "type": "response.created",
+                "response": {**reply, "status": "in_progress", "output": []},
+            },
+            {
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "item_id": reply["output"][0]["id"],
+                "content_index": 0,
+                "delta": "Fine.",
+                "logprobs": [],
+            },
+            {"type": "response.completed", "response": reply},
+        ),
+    )
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="k", use_previous_response_id=True)
+    history = [
+        HumanMessage("Hello"),
+        AIMessage("Hi.", response_metadata={"id": "resp_previous"}),
+        HumanMessage("How are you?"),
+    ]
+
+    if method == "stream":
+        message = _merge(list(llm.stream(history)))
+    else:
+        message = _merge([chunk async for chunk in llm.astream(history)])
+
+    assert json.loads(requests[0].content)["previous_response_id"] == "resp_previous"
+    assert message.response_metadata["id"] == "resp_1"
+
+
+@pytest.mark.parametrize(
+    "system", [SystemMessage("Rules"), ChatMessage(role="system", content="Rules")]
+)
+def test_use_previous_response_id_keeps_string_system_instructions(system: Any) -> None:
+    """A string system message stays, since the server never carries instructions over."""
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="k", use_previous_response_id=True)
+    messages, response_id = llm._messages_for_request(
+        [
+            system,
+            HumanMessage("Hello"),
+            AIMessage("Hi", response_metadata={"id": "resp_1"}),
+            HumanMessage("Again"),
+        ],
+        {},
+    )
+
+    assert messages == [system, HumanMessage("Again")]
+    assert response_id == "resp_1"
+
+
+def test_use_previous_response_id_does_not_retain_list_system_content() -> None:
+    """List content went as a stored input item, so the trim drops it."""
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="k", use_previous_response_id=True)
+    history = [
+        SystemMessage([{"type": "text", "text": "Rules"}]),
+        HumanMessage("Hello"),
+        AIMessage("Hi", response_metadata={"id": "resp_1"}),
+        HumanMessage("Again"),
+    ]
+
+    messages, response_id = llm._messages_for_request(history, {})
+
+    assert messages == [HumanMessage("Again")]
+    assert response_id == "resp_1"
+
+
+@pytest.mark.parametrize("response_id", ["chatcmpl-1", "", None])
+def test_use_previous_response_id_skips_non_responses_ids(
+    response_id: str | None,
+) -> None:
+    """Only a ``resp_`` id chains; any other id sends the full history."""
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="k", use_previous_response_id=True)
+    history = [
+        HumanMessage("Old"),
+        AIMessage("Answer", response_metadata={"id": response_id}),
+        HumanMessage("New"),
+    ]
+
+    messages, chained_id = llm._messages_for_request(history, {})
+
+    assert messages == history
+    assert chained_id is None
+
+
+def test_use_previous_response_id_walks_back_past_chat_completion_id() -> None:
+    """A later non-Responses reply goes out with the turns after the stored one."""
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="k", use_previous_response_id=True)
+    history = [
+        HumanMessage("Old"),
+        AIMessage("Stored", response_metadata={"id": "resp_1"}),
+        HumanMessage("Intervening"),
+        AIMessage("Unstored", response_metadata={"id": "chatcmpl-1"}),
+        HumanMessage("New"),
+    ]
+
+    messages, chained_id = llm._messages_for_request(history, {})
+
+    assert messages == history[2:]
+    assert chained_id == "resp_1"
+
+
+def test_explicit_previous_response_id_disables_history_trimming() -> None:
+    """A caller's own previous_response_id leaves the history as given."""
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="k", use_previous_response_id=True)
+    history = [
+        HumanMessage("Old"),
+        AIMessage("Stored", response_metadata={"id": "resp_history"}),
+        HumanMessage("New"),
+    ]
+
+    messages, chained_id = llm._messages_for_request(
+        history, {"previous_response_id": "resp_explicit"}
+    )
+
+    assert messages == history
+    assert chained_id is None
+
+
+def test_use_previous_response_id_flag_off_keeps_history() -> None:
+    """Without the flag, a history holding a stored id goes out whole."""
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="k")
+    history = [
+        HumanMessage("Old"),
+        AIMessage("Stored", response_metadata={"id": "resp_history"}),
+        HumanMessage("New"),
+    ]
+
+    messages, chained_id = llm._messages_for_request(history, {})
+
+    assert messages == history
+    assert chained_id is None
+
+
+@pytest.mark.parametrize("kind", ["model", "router"])
+@pytest.mark.parametrize(
+    "system", [SystemMessage("Rules"), ChatMessage(role="system", content="Rules")]
+)
+def test_use_previous_response_id_resends_system_instructions(
+    monkeypatch: pytest.MonkeyPatch, kind: str, system: Any
+) -> None:
+    """The chained request carries the system message as instructions."""
+    requests = serve_http(monkeypatch, responses_api_reply(message_item("Fine.")))
+    if kind == "model":
+        llm = ChatLiteLLM(
+            model="gpt-4o-mini", api_key="k", use_previous_response_id=True
+        )
+    else:
+        llm = ChatLiteLLMRouter(
+            router=litellm.Router(
+                model_list=[
+                    {
+                        "model_name": "gpt-4o-mini",
+                        "litellm_params": {
+                            "model": "openai/responses/gpt-4o-mini",
+                            "api_key": "k",
+                        },
+                    }
+                ]
+            ),
+            use_previous_response_id=True,
+        )
+
+    llm.invoke(
+        [
+            system,
+            HumanMessage("Earlier"),
+            AIMessage("A", response_metadata={"id": "resp_previous"}),
+            HumanMessage("Now"),
+        ]
+    )
+
+    payload = json.loads(requests[0].content)
+    assert payload["instructions"] == "Rules"
+    assert payload["previous_response_id"] == "resp_previous"
+    assert [item["role"] for item in payload["input"]] == ["user"]
+
+
+def test_use_previous_response_id_rejects_per_call_flag() -> None:
+    """The flag is a model field, so a per-call value is refused."""
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="k")
+
+    with pytest.raises(ValueError) as exc_info:
+        llm.invoke("hi", use_previous_response_id=True)
+
+    assert str(exc_info.value) == (
+        "Set use_previous_response_id on the ChatLiteLLM model, not in bind() or "
+        "per-call arguments."
+    )
+
+
+def test_use_previous_response_id_rejects_model_kwargs_flag() -> None:
+    """The flag in model_kwargs is refused rather than sent to the provider."""
+    llm = ChatLiteLLM(
+        model="gpt-4o-mini",
+        api_key="k",
+        model_kwargs={"use_previous_response_id": True},
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        llm.invoke("hi")
+
+    assert str(exc_info.value) == (
+        "Set use_previous_response_id on the ChatLiteLLM model, not in model_kwargs."
+    )
+
+
+def test_use_previous_response_id_rejects_store_false() -> None:
+    """Chaining needs stored replies, so store=False is refused."""
+    llm = ChatLiteLLM(
+        model="gpt-4o-mini",
+        api_key="k",
+        use_previous_response_id=True,
+        model_kwargs={"store": False},
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        llm.invoke("hi")
+
+    assert str(exc_info.value) == (
+        "use_previous_response_id=True requires stored Responses API replies, but "
+        "store=False was configured in store or extra_body. Remove store=False or "
+        "disable use_previous_response_id."
+    )
+
+
+def test_use_previous_response_id_rejects_extra_body_store_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stateless extra_body setting cannot support server-side chaining."""
+    requests = serve_http(monkeypatch, responses_api_reply(message_item("ok")))
+    llm = ChatLiteLLM(
+        model="gpt-4o-mini",
+        api_key="k",
+        use_previous_response_id=True,
+        model_kwargs={"extra_body": {"store": False}},
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        llm.invoke("hi")
+
+    assert str(exc_info.value) == (
+        "use_previous_response_id=True requires stored Responses API replies, but "
+        "store=False was configured in store or extra_body. Remove store=False or "
+        "disable use_previous_response_id."
+    )
+    assert requests == []
+
+
+def test_use_previous_response_id_rejects_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Model fallbacks are rejected before the first turn is sent."""
+    requests = serve_http(monkeypatch, responses_api_reply(message_item("ok")))
+    llm = ChatLiteLLM(
+        model="gpt-4o-mini",
+        api_key="k",
+        use_previous_response_id=True,
+        model_kwargs={"fallbacks": [{"model": "openai/gpt-4o-mini"}]},
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        llm.invoke("first turn")
+
+    assert str(exc_info.value) == (
+        "use_previous_response_id=True cannot be used because fallbacks is "
+        "configured; remove that fallback setting or disable "
+        "use_previous_response_id."
+    )
+    assert requests == []
+
+
+def test_use_previous_response_id_rejects_global_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LiteLLM-wide fallbacks are rejected before the first turn is sent."""
+    requests = serve_http(monkeypatch, responses_api_reply(message_item("ok")))
+    monkeypatch.setattr(litellm, "model_fallbacks", [{"model": "openai/gpt-4o-mini"}])
+    llm = ChatLiteLLM(
+        model="gpt-4o-mini",
+        api_key="k",
+        use_previous_response_id=True,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        llm.invoke("first turn")
+
+    assert str(exc_info.value) == (
+        "use_previous_response_id=True cannot be used because "
+        "litellm.model_fallbacks is set; remove that fallback setting or disable "
+        "use_previous_response_id."
+    )
+    assert requests == []
+
+
+@pytest.mark.parametrize("method", ["stream", "astream"])
+@pytest.mark.asyncio
+async def test_stream_keeps_a_responses_api_id(method: str) -> None:
+    """Only the final response id is retained when chunks are merged."""
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="k")
+    chunks = [
+        {
+            "id": "resp_primary",
+            "choices": [{"delta": {"role": "assistant", "content": "Fine."}}],
+        },
+        {
+            "id": "resp_backup",
+            "choices": [{"delta": {"content": ""}, "finish_reason": "stop"}],
+        },
+    ]
+
+    if method == "stream":
+        with patch.object(llm.client, "completion", return_value=iter(chunks)):
+            message = _merge(list(llm.stream("hi")))
+    else:
+
+        async def _stream() -> Any:
+            for chunk in chunks:
+                yield chunk
+
+        with patch.object(
+            llm.client, "acompletion", new=AsyncMock(return_value=_stream())
+        ):
+            message = _merge([chunk async for chunk in llm.astream("hi")])
+
+    assert message.response_metadata["id"] == "resp_backup"
+
+
+def test_a_split_reply_keeps_every_text_part(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bridge also gives each text part of one message a choice of its own."""
+    serve_http(
+        monkeypatch, responses_api_reply(message_item("Part one. ", "Part two."))
+    )
+
+    message = ChatLiteLLM(model=_BRIDGED_MODEL, api_key="k").invoke("hi")
+
+    assert message.content == "Part one. Part two."
+
+
+def test_a_split_reply_keeps_the_reasoning_before_each_part(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each choice carries the reasoning that preceded its part; a stream joins both."""
+    serve_http(
+        monkeypatch,
+        responses_api_reply(
+            reasoning_item("rs_1", "Think A."),
+            message_item("Checking."),
+            reasoning_item("rs_2", "Think B."),
+            function_call_item("call_1", '{"city": "Paris"}'),
+        ),
+    )
+
+    message = ChatLiteLLM(model=_BRIDGED_MODEL, api_key="k").invoke("weather?")
+
+    assert message.additional_kwargs["reasoning_content"] == "Think A.Think B."
+
+
+@pytest.mark.parametrize("method", ["generate", "agenerate"])
+@pytest.mark.asyncio
+async def test_n_above_one_keeps_each_completion(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """With `n` above one, each choice is a separate completion."""
+    serve_http(monkeypatch, chat_completion_reply("A", "B"))
+    llm = ChatLiteLLM(model="openai/gpt-4o-mini", api_key="k")
+
+    if method == "generate":
+        result = llm.generate([[HumanMessage("hi")]], n=2)
+    else:
+        result = await llm.agenerate([[HumanMessage("hi")]], n=2)
+
+    assert [generation.text for generation in result.generations[0]] == ["A", "B"]
+
+
+def test_a_single_choice_reply_keeps_what_a_rejoin_would_drop() -> None:
+    """Only a split reply is rebuilt; one choice arrives with every field it carries."""
+    grounding = {"grounding_metadata": {"search_queries": ["Earth orbit"]}}
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "The Earth orbits the Sun",
+                    "provider_specific_fields": grounding,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="k")
+
+    with patch.object(llm.client, "completion", return_value=response):
+        message = llm.invoke("hi")
+
+    assert message.additional_kwargs["provider_specific_fields"] == grounding
 
 
 # ── usage metadata ─────────────────────────────────────────────────────────────
@@ -238,44 +1363,57 @@ def test_create_usage_metadata_handles_none_values() -> None:
     assert meta["total_tokens"] == 0
 
 
-# ── reasoning content injection ────────────────────────────────────────────────
+# ── reasoning content stays out of message content ─────────────────────────────
 
 
-def test_inject_reasoning_content_into_string_content() -> None:
-    result = _inject_reasoning_content_into_content("answer", "hidden chain")
+def test_reasoning_content_does_not_alter_content_for_dict() -> None:
+    """`.content` must stay a plain str; reasoning_content lives in additional_kwargs."""
+    mock_dict = {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning_content": "hidden chain",
+    }
 
-    assert result == [
-        {"type": "thinking", "thinking": "hidden chain"},
-        {"type": "text", "text": "answer"},
-    ]
+    message = _convert_dict_to_message(mock_dict)
 
-
-def test_inject_reasoning_content_into_empty_content() -> None:
-    result = _inject_reasoning_content_into_content("", "hidden chain")
-
-    assert result == [{"type": "thinking", "thinking": "hidden chain"}]
-
-
-def test_inject_reasoning_content_prepends_for_list_without_thinking() -> None:
-    content = [{"type": "text", "text": "answer"}]
-
-    result = _inject_reasoning_content_into_content(content, "hidden chain")
-
-    assert result == [
-        {"type": "thinking", "thinking": "hidden chain"},
-        {"type": "text", "text": "answer"},
-    ]
+    assert message.content == "answer"
+    assert message.additional_kwargs["reasoning_content"] == "hidden chain"
 
 
-def test_inject_reasoning_content_does_not_duplicate_existing_thinking() -> None:
-    content = [
-        {"type": "thinking", "thinking": "already there"},
-        {"type": "text", "text": "answer"},
-    ]
+def test_reasoning_content_does_not_alter_empty_content_for_dict() -> None:
+    mock_dict = {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "hidden chain",
+    }
 
-    result = _inject_reasoning_content_into_content(content, "hidden chain")
+    message = _convert_dict_to_message(mock_dict)
 
-    assert result == content
+    assert message.content == ""
+    assert message.additional_kwargs["reasoning_content"] == "hidden chain"
+
+
+def test_reasoning_content_does_not_alter_content_for_delta() -> None:
+    mock_delta = {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning_content": "hidden chain",
+    }
+
+    chunk = _convert_delta_to_message_chunk(mock_delta, AIMessageChunk)
+
+    assert chunk.content == "answer"
+    assert chunk.additional_kwargs["reasoning_content"] == "hidden chain"
+
+
+def test_reasoning_content_surfaces_as_standard_content_block() -> None:
+    """Consumers reading the standard `content_blocks` API (e.g. LangGraph) still
+    see reasoning content even though it is no longer duplicated into `.content`."""
+    message = AIMessage(
+        content="answer", additional_kwargs={"reasoning_content": "hidden chain"}
+    )
+
+    assert {"type": "reasoning", "reasoning": "hidden chain"} in message.content_blocks
 
 
 # ── credential forwarding ─────────────────────────────────────────────────────
@@ -296,33 +1434,63 @@ def test_client_params_forwards_api_key() -> None:
 # ── stream_options ─────────────────────────────────────────────────────────────
 
 
-def test_stream_options_set_for_non_openai_model() -> None:
-    """stream_options must be set for non-OpenAI providers too."""
-    llm = ChatLiteLLM(model="anthropic/claude-3-5-sonnet-20241022", api_key="fake")
-    _, params = llm._create_message_dicts([], None)
-    # Simulate what _stream does
-    params = {**params, "stream": True}
-    if llm.stream_options is not None:
-        params["stream_options"] = llm.stream_options
-    else:
-        params["stream_options"] = {"include_usage": True}
-    assert params.get("stream_options") == {"include_usage": True}
+_STREAM_OPTIONS = {"include_usage": True, "include_obfuscation": False}
 
 
-def test_stream_options_respected_when_set_explicitly() -> None:
-    """User-provided stream_options must not be overwritten."""
-    custom = {"include_usage": False}
-    llm = ChatLiteLLM(
-        model="anthropic/claude-3-5-sonnet-20241022",
-        api_key="fake",
-        stream_options=custom,
-    )
-    params = {}
-    if llm.stream_options is not None:
-        params["stream_options"] = llm.stream_options
-    else:
-        params["stream_options"] = {"include_usage": True}
-    assert params["stream_options"] == custom
+async def _no_chunks() -> Any:
+    return
+    yield
+
+
+@pytest.mark.parametrize("method", ["stream", "astream"])
+@pytest.mark.parametrize(
+    ("constructor", "call", "sent"),
+    [
+        ({}, {}, {"include_usage": True}),
+        ({"stream_options": _STREAM_OPTIONS}, {}, _STREAM_OPTIONS),
+        ({"model_kwargs": {"stream_options": _STREAM_OPTIONS}}, {}, _STREAM_OPTIONS),
+        ({}, {"stream_options": _STREAM_OPTIONS}, _STREAM_OPTIONS),
+        (
+            {
+                "stream_options": {"include_usage": True},
+                "model_kwargs": {"stream_options": _STREAM_OPTIONS},
+            },
+            {},
+            _STREAM_OPTIONS,
+        ),
+        (
+            {"model_kwargs": {"stream_options": {"include_usage": True}}},
+            {"stream_options": _STREAM_OPTIONS},
+            _STREAM_OPTIONS,
+        ),
+    ],
+    ids=[
+        "default",
+        "field",
+        "model_kwargs",
+        "per-call",
+        "model_kwargs-over-field",
+        "per-call-over-model_kwargs",
+    ],
+)
+async def test_stream_options_sent_from_each_source(
+    method: str, constructor: dict[str, Any], call: dict[str, Any], sent: Any
+) -> None:
+    """The default fills only a gap, so no source the caller used is overwritten."""
+    llm = ChatLiteLLM(model="gpt-4o-mini", **constructor)
+
+    with pytest.raises(ValueError, match="No generation chunks"):
+        if method == "stream":
+            with patch("litellm.completion", return_value=iter([])) as completion:
+                list(llm.stream("hi", **call))
+        else:
+            with patch(
+                "litellm.acompletion", AsyncMock(return_value=_no_chunks())
+            ) as completion:
+                async for _ in llm.astream("hi", **call):
+                    pass
+
+    assert completion.call_args.kwargs["stream_options"] == sent
 
 
 # ── tool_choice mapping with thinking enabled ──────────────────────────────────
@@ -344,18 +1512,20 @@ def test_bind_tools_any_becomes_required_without_thinking() -> None:
         "required",
         True,
         {"type": "function", "function": {"name": "_dummy_tool"}},
+        {"type": "required"},
+        "_dummy_tool",
     ],
-    ids=["any", "required", "True", "dict"],
+    ids=["any", "required", "True", "dict", "dict-required", "name"],
 )
 def test_bind_tools_downgraded_with_thinking(
-    tool_choice: Union[str, bool, Dict[str, Any]],
+    tool_choice: str | bool | dict[str, Any],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Forced tool_choice values should be downgraded to 'auto' when thinking
     is enabled, so the model can produce CoT text before tool calls.
     """
     llm = ChatLiteLLM(
-        model="anthropic/claude-sonnet-4-20250514",
+        model="anthropic/claude-sonnet-4-5",
         api_key="fake",
         model_kwargs=_THINKING_KWARGS,
     )
@@ -367,6 +1537,179 @@ def test_bind_tools_downgraded_with_thinking(
     assert "incompatible with thinking" in caplog.text
 
 
+# Newer litellm reads a bool thinking as manual thinking.
+_BOOL_THINKING_IS_MANUAL = isinstance(
+    litellm.utils.validate_and_fix_thinking_param(True), dict
+)
+
+# Downgraded on every supported version: manual thinking set in model_kwargs, or
+# thinking litellm sends as manual.
+_MANUAL_THINKING = [
+    ("anthropic/claude-sonnet-4-5", {}, _THINKING_KWARGS),
+    ("anthropic/claude-sonnet-4-5", {"reasoning_effort": "high"}, {}),
+    ("anthropic/claude-sonnet-4-5", {}, {"reasoning_effort": "high"}),
+    ("anthropic/claude-fable-5-1", _THINKING_KWARGS, {}),
+    (
+        "anthropic/claude-sonnet-4-6",
+        {"model": "anthropic/claude-sonnet-4-5", "reasoning_effort": "high"},
+        {},
+    ),
+    ("openai/gpt-4o", {"model": "anthropic/claude-sonnet-4-5", **_THINKING_KWARGS}, {}),
+    pytest.param(
+        "anthropic/claude-sonnet-4-5",
+        {},
+        {"thinking": True},
+        marks=pytest.mark.skipif(
+            not _BOOL_THINKING_IS_MANUAL, reason="this litellm leaves a bool unmapped"
+        ),
+    ),
+]
+_MANUAL_THINKING_IDS = [
+    "thinking-bound",
+    "effort-in-model-kwargs",
+    "effort-bound",
+    "manual-in-model-kwargs",
+    "effort-for-the-model-kwargs-destination",
+    "manual-for-the-model-kwargs-destination",
+    "bool-thinking-bound",
+]
+
+# ...and adaptive thinking for these, beside which Anthropic accepts a forced tool.
+_ADAPTIVE_THINKING = [
+    ("anthropic/claude-sonnet-4-6", {"thinking": {"type": "adaptive"}}),
+    ("anthropic/claude-sonnet-4-6", {"reasoning_effort": "high"}),
+]
+_ADAPTIVE_THINKING_IDS = ["adaptive", "effort"]
+
+
+@pytest.mark.parametrize(
+    ("model", "model_kwargs", "bind_kwargs"),
+    _MANUAL_THINKING,
+    ids=_MANUAL_THINKING_IDS,
+)
+def test_bind_tools_downgraded_wherever_thinking_is_set(
+    model: str,
+    model_kwargs: dict[str, Any],
+    bind_kwargs: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Each of these turns manual thinking on for the call, so each needs the downgrade."""
+    llm = ChatLiteLLM(model=model, api_key="fake", model_kwargs=model_kwargs)
+    with (
+        patch.object(ChatLiteLLM, "_model_refuses_forced_tools", return_value=False),
+        caplog.at_level(
+            logging.WARNING, logger="langchain_litellm.chat_models.litellm"
+        ),
+    ):
+        bound = llm.bind_tools([_dummy_tool], tool_choice="required", **bind_kwargs)
+    assert bound.kwargs["tool_choice"] == "auto"  # type: ignore[attr-defined]
+    assert "incompatible with thinking" in caplog.text
+
+
+@pytest.mark.parametrize("alias", ["fast", "gpt-4o"])
+@pytest.mark.parametrize(
+    "model_kwargs",
+    [_THINKING_KWARGS, {"reasoning_effort": "high"}],
+    ids=["manual", "effort"],
+)
+def test_bind_tools_downgrades_for_an_alias_of_claude(
+    alias: str,
+    model_kwargs: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """litellm swaps an alias in before it routes, so its name decides nothing.
+
+    Neither name says Claude, and litellm routes ``gpt-4o`` on its own.
+    """
+    monkeypatch.setitem(litellm.model_alias_map, alias, "anthropic/claude-sonnet-4-5")
+    llm = ChatLiteLLM(model=alias, api_key="fake", model_kwargs=model_kwargs)
+    with caplog.at_level(
+        logging.WARNING, logger="langchain_litellm.chat_models.litellm"
+    ):
+        bound = llm.bind_tools([_dummy_tool], tool_choice="required")
+    assert bound.kwargs["tool_choice"] == "auto"  # type: ignore[attr-defined]
+    assert "incompatible with thinking" in caplog.text
+
+
+def test_bind_tools_keeps_required_for_a_non_claude_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-claude alias must not downgrade a forced tool choice."""
+    monkeypatch.setitem(
+        litellm.model_alias_map,
+        "my-gpt-alias",
+        "openai/gpt-4o",
+    )
+
+    llm = ChatLiteLLM(
+        model="my-gpt-alias",
+        api_key="fake",
+        model_kwargs={"reasoning_effort": "high"},
+    )
+
+    bound = llm.bind_tools([_dummy_tool], tool_choice="required")
+
+    assert bound.kwargs["tool_choice"] == "required"  # type: ignore[attr-defined]
+
+
+@pytest.mark.skipif(
+    not OPUS_4_7_THINKS_ADAPTIVELY, reason="this litellm sends it manual thinking"
+)
+def test_bind_tools_keeps_a_forced_choice_litellm_sends_beside_adaptive_thinking() -> (
+    None
+):
+    """Thinking passed at bind time counts only as litellm sends it."""
+    llm = ChatLiteLLM(model="anthropic/claude-opus-4-7", api_key="fake")
+
+    bound = llm.bind_tools([_dummy_tool], tool_choice="required", **_THINKING_KWARGS)
+
+    assert bound.kwargs["tool_choice"] == "required"  # type: ignore[attr-defined]
+
+
+def test_bind_tools_keeps_a_forced_choice_when_max_tokens_leaves_no_thinking() -> None:
+    """litellm sends no thinking that max_tokens cannot hold."""
+    llm = ChatLiteLLM(
+        model="anthropic/claude-sonnet-4-5",
+        api_key="fake",
+        max_tokens=1000,
+        model_kwargs={"thinking": {"type": "adaptive"}},
+    )
+
+    bound = llm.bind_tools([_dummy_tool], tool_choice="required")
+
+    assert bound.kwargs["tool_choice"] == "required"  # type: ignore[attr-defined]
+
+
+def test_bind_tools_leaves_a_name_litellm_resolves_later_to_the_call() -> None:
+    """litellm resolves an alias only when the call is made, so it cannot answer here."""
+    llm = ChatLiteLLM(
+        model="my-claude-alias",
+        api_key="fake",
+        model_kwargs={"reasoning_effort": "high"},
+    )
+
+    bound = llm.bind_tools([_dummy_tool], tool_choice="required")
+
+    assert bound.kwargs["tool_choice"] == "required"  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("model", "model_kwargs"), _ADAPTIVE_THINKING, ids=_ADAPTIVE_THINKING_IDS
+)
+def test_bind_tools_keeps_a_forced_choice_beside_adaptive_thinking(
+    model: str, model_kwargs: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Anthropic refuses a forced tool only beside manual thinking."""
+    llm = ChatLiteLLM(model=model, api_key="fake", model_kwargs=model_kwargs)
+    with caplog.at_level(
+        logging.WARNING, logger="langchain_litellm.chat_models.litellm"
+    ):
+        bound = llm.bind_tools([_dummy_tool], tool_choice="required")
+    assert bound.kwargs["tool_choice"] == "required"  # type: ignore[attr-defined]
+    assert "incompatible with thinking" not in caplog.text
+
+
 @pytest.mark.parametrize(
     "tool_choice",
     [
@@ -374,11 +1717,12 @@ def test_bind_tools_downgraded_with_thinking(
         "required",
         True,
         {"type": "function", "function": {"name": "_dummy_tool"}},
+        {"type": "required"},
     ],
-    ids=["any", "required", "True", "dict"],
+    ids=["any", "required", "True", "dict", "dict-required"],
 )
 def test_bind_tools_not_downgraded_with_thinking_on_non_claude_models(
-    tool_choice: Union[str, bool, Dict[str, Any]],
+    tool_choice: str | bool | dict[str, Any],
 ) -> None:
     """Forced tool choices should be preserved for non-Claude models."""
     llm = ChatLiteLLM(
@@ -393,11 +1737,11 @@ def test_bind_tools_not_downgraded_with_thinking_on_non_claude_models(
 
 @pytest.mark.parametrize(
     "tool_choice",
-    ["auto", "none", None, False],
-    ids=["auto", "none", "None", "False"],
+    ["auto", "none", None, False, {"type": "none"}, {"type": "web_search"}],
+    ids=["auto", "none", "None", "False", "dict-none", "dict-built-in"],
 )
 def test_bind_tools_non_forced_unchanged_with_thinking(
-    tool_choice: Optional[Union[str, bool]],
+    tool_choice: str | bool | dict[str, Any] | None,
 ) -> None:
     """Non-forced tool_choice values should pass through untouched."""
     llm = ChatLiteLLM(
@@ -415,7 +1759,7 @@ def test_bind_tools_non_forced_unchanged_with_thinking(
     ids=["None", "empty", "disabled"],
 )
 def test_bind_tools_no_downgrade_without_thinking_enabled(
-    thinking_config: Optional[Dict[str, Any]],
+    thinking_config: dict[str, Any] | None,
 ) -> None:
     """tool_choice='any' should stay 'required' when thinking is not enabled."""
     kwargs: dict = {}
@@ -444,9 +1788,448 @@ def test_bind_tools_dict_validation_with_thinking() -> None:
         )
 
 
-def test_with_structured_output_function_calling_warns_and_raises_for_claude_thinking() -> (
-    None
-):
+_FLAT_FUNCTION_TOOL = {
+    "type": "function",
+    "name": "lookup",
+    "parameters": {"type": "object", "properties": {}},
+    "strict": False,
+}
+
+
+@pytest.mark.parametrize("by_name", [False, True], ids=["dict", "name"])
+@pytest.mark.parametrize(
+    ("tools", "name"),
+    [
+        ([_dummy_tool], "_dummy_tool"),
+        ([_dummy_tool, {"type": "web_search"}], "_dummy_tool"),
+        ([_FLAT_FUNCTION_TOOL], "lookup"),
+    ],
+    ids=["function", "beside-built-in", "flat-function"],
+)
+def test_bind_tools_forces_a_function_bound_in_any_shape(
+    tools: list[Any], name: str, by_name: bool
+) -> None:
+    """Built-in and Responses-style tools carry no ``function`` key to read a name from.
+
+    A bare tool name is no choice litellm understands, so it becomes the function choice.
+    """
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="fake")
+    choice = {"type": "function", "function": {"name": name}}
+
+    bound = llm.bind_tools(tools, tool_choice=name if by_name else choice)
+
+    assert bound.kwargs["tool_choice"] == choice  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("tools", "tool_choice"),
+    [
+        ([_dummy_tool, {"type": "web_search"}], {"type": "web_search"}),
+        ([_dummy_tool], {"type": "auto"}),
+        ([_FLAT_FUNCTION_TOOL], {"type": "function", "name": "lookup"}),
+    ],
+    ids=["built-in", "auto", "flat-function-choice"],
+)
+def test_bind_tools_leaves_other_dict_choices_to_litellm(
+    tools: list[Any], tool_choice: dict[str, Any]
+) -> None:
+    """Only a function choice names a tool to check; litellm accepts or refuses the rest."""
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="fake")
+
+    bound = llm.bind_tools(tools, tool_choice=tool_choice)
+
+    assert bound.kwargs["tool_choice"] == tool_choice  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("keyword", "sent"),
+    [("auto", "auto"), ("none", "none"), ("required", "required"), ("any", "required")],
+)
+def test_bind_tools_keeps_a_keyword_that_a_tool_is_named_after(
+    keyword: str, sent: str
+) -> None:
+    """A keyword means the same whichever tools are bound and wherever the call goes."""
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="fake")
+    tool = {
+        "type": "function",
+        "function": {"name": keyword, "parameters": {"type": "object"}},
+    }
+
+    bound = llm.bind_tools([tool], tool_choice=keyword)
+
+    assert bound.kwargs["tool_choice"] == sent  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("tools", "tool_choice"),
+    [
+        ([_dummy_tool], "nonexistent"),
+        ([_dummy_tool, {"type": "web_search"}], "web_search"),
+    ],
+    ids=["typo", "built-in"],
+)
+def test_bind_tools_rejects_a_string_naming_no_bound_function(
+    tools: list[Any], tool_choice: str
+) -> None:
+    """Providers read such a string differently, from an error to a silent drop."""
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="fake")
+
+    with pytest.raises(
+        ValueError, match=re.escape(f"tool_choice names {tool_choice!r}")
+    ):
+        llm.bind_tools(tools, tool_choice=tool_choice)
+
+
+_CUSTOM_TOOL = Tool(
+    name="grep",
+    func=lambda pattern: pattern,
+    description="Search text for a pattern.",
+    metadata={"type": "custom_tool"},
+)
+
+
+@pytest.mark.parametrize(
+    ("tools", "name", "function_names"),
+    [
+        ([_dummy_tool, {"type": "web_search"}], "web_search", ["_dummy_tool"]),
+        ([_dummy_tool, _CUSTOM_TOOL], "grep", ["_dummy_tool"]),
+        ([{"type": "web_search"}], "_dummy_tool", []),
+    ],
+    ids=["built-in", "custom", "only-built-ins"],
+)
+def test_bind_tools_rejects_a_function_choice_naming_no_bound_function(
+    tools: list[Any], name: str, function_names: list[str]
+) -> None:
+    """Only a bound function tool can be forced by a function choice."""
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="fake")
+
+    message = (
+        f"tool_choice names {name!r}, but the bound function tools are "
+        f"{function_names}."
+    )
+    with pytest.raises(ValueError, match=re.escape(message)):
+        llm.bind_tools(
+            tools, tool_choice={"type": "function", "function": {"name": name}}
+        )
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        "required",
+        "any",
+        True,
+        "_dummy_tool",
+        {"type": "function", "function": {"name": "_dummy_tool"}},
+        {"type": "required"},
+    ],
+    ids=["required", "any", "true", "name", "function", "required-dict"],
+)
+@pytest.mark.parametrize(
+    "model_kwargs",
+    [
+        {},
+        {"thinking": {"type": "adaptive"}},
+    ],
+    ids=["no-thinking", "adaptive_thinking"],
+)
+def test_bind_tools_downgrades_model_unsupported_forced_choices(
+    tool_choice: str | bool | dict[str, Any],
+    model_kwargs: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """litellm's model map marks Fable 5.1 as refusing any forced tool."""
+    llm = ChatLiteLLM(
+        model="anthropic/claude-fable-5-1",
+        api_key="fake",
+        model_kwargs=model_kwargs,
+    )
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="langchain_litellm.chat_models.litellm",
+    ):
+        bound = llm.bind_tools([_dummy_tool], tool_choice=tool_choice)
+
+    assert bound.kwargs["tool_choice"] == "auto"  # type: ignore[attr-defined]
+    assert "unsupported by this model" in caplog.text
+    assert "tool calls may be omitted" in caplog.text
+    assert "incompatible with thinking" not in caplog.text
+
+
+@pytest.mark.parametrize("tool_choice", ["auto", "none", None, False])
+def test_bind_tools_preserves_non_forced_choices_for_unsupported_model(
+    tool_choice: str | bool | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    llm = ChatLiteLLM(
+        model="anthropic/claude-fable-5-1",
+        api_key="fake",
+    )
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="langchain_litellm.chat_models.litellm",
+    ):
+        bound = llm.bind_tools([_dummy_tool], tool_choice=tool_choice)
+
+    assert bound.kwargs["tool_choice"] == tool_choice  # type: ignore[attr-defined]
+    assert "Downgrading tool_choice" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        "missing_tool",
+        {"type": "function", "function": {"name": "missing_tool"}},
+    ],
+    ids=["name", "function"],
+)
+def test_bind_tools_validate_tool_before_model_downgrade(
+    tool_choice: str | dict[str, Any],
+) -> None:
+    llm = ChatLiteLLM(
+        model="anthropic/claude-fable-5-1",
+        api_key="fake",
+    )
+
+    with pytest.raises(ValueError, match="missing_tool"):
+        llm.bind_tools([_dummy_tool], tool_choice=tool_choice)
+
+
+@pytest.mark.parametrize(
+    ("constructor_kwargs", "bind_kwargs", "expected"),
+    [
+        ({"model": "anthropic/claude-sonnet-4-5"}, {}, "required"),
+        ({"model": "claude-opus-5-5"}, {}, "auto"),
+        ({"model": "vertex_ai/claude-opus-5-5"}, {}, "auto"),
+        ({"model": "bedrock/us.anthropic.claude-opus-5-5"}, {}, "auto"),
+        ({"model": "litellm_proxy/claude-opus-5-5"}, {}, "auto"),
+        ({"model": "my-org/claude-opus-5-5"}, {}, "required"),
+        (
+            {
+                "model": "databricks-claude-opus-5-5",
+                "custom_llm_provider": "databricks",
+            },
+            {},
+            "auto",
+        ),
+        (
+            {
+                "model": "anthropic/claude-sonnet-4-5",
+                "model_name": "anthropic/claude-fable-5-1",
+            },
+            {},
+            "auto",
+        ),
+        (
+            {
+                "model": "anthropic/claude-sonnet-4-5",
+                "model_kwargs": {"model": "anthropic/claude-fable-5-1"},
+            },
+            {},
+            "auto",
+        ),
+        (
+            {
+                "model": "anthropic/claude-fable-5-1",
+                "model_kwargs": {"model": "anthropic/claude-sonnet-4-5"},
+            },
+            {},
+            "required",
+        ),
+        (
+            {"model": "anthropic/claude-sonnet-4-5"},
+            {"model": "anthropic/claude-fable-5-1"},
+            "auto",
+        ),
+        (
+            {"model": "databricks-claude-opus-5-5"},
+            {"custom_llm_provider": "databricks"},
+            "auto",
+        ),
+    ],
+    ids=[
+        "supported-model",
+        "bare-name",
+        "map-key-with-its-prefix",
+        "bedrock-inference-profile",
+        "provider-prefix",
+        "prefix-litellm-does-not-route",
+        "map-key-under-custom_llm_provider",
+        "model_name",
+        "model_kwargs",
+        "model_kwargs-to-a-supported-model",
+        "binding-override",
+        "bound-custom_llm_provider",
+    ],
+)
+def test_model_forced_tool_capability_uses_effective_model(
+    constructor_kwargs: dict[str, Any],
+    bind_kwargs: dict[str, Any],
+    expected: str,
+) -> None:
+    """Each answer is for the model the call reaches, under each name the map keys."""
+    llm = ChatLiteLLM(api_key="fake", **constructor_kwargs)
+
+    bound = llm.bind_tools([_dummy_tool], tool_choice="required", **bind_kwargs)
+
+    assert bound.kwargs["tool_choice"] == expected  # type: ignore[attr-defined]
+
+
+def test_model_forced_tool_capability_follows_the_alias_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """litellm swaps a model_alias_map alias for its target before it sends."""
+    monkeypatch.setattr(
+        litellm, "model_alias_map", {"fast": "anthropic/claude-fable-5-1"}
+    )
+
+    bound = ChatLiteLLM(model="fast", api_key="fake").bind_tools(
+        [_dummy_tool], tool_choice="required"
+    )
+
+    assert bound.kwargs["tool_choice"] == "auto"  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [("team-claude", "required"), ("github_copilot/claude-opus-5-5", "auto")],
+    ids=["name-litellm-cannot-route", "provider-that-logs-in"],
+)
+def test_model_forced_tool_capability_resolves_no_provider(
+    model: str, expected: str
+) -> None:
+    """litellm's provider lookup never runs for this check.
+
+    It prints a banner for a name it cannot route, and logs in to some providers.
+    """
+    llm = ChatLiteLLM(model=model, api_key="fake")
+
+    with patch.object(
+        litellm, "get_llm_provider", side_effect=AssertionError("resolved")
+    ):
+        bound = llm.bind_tools([_dummy_tool], tool_choice="required")
+
+    assert bound.kwargs["tool_choice"] == expected  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "model_kwargs",
+    [
+        {},
+        {"thinking": {"type": "adaptive"}},
+    ],
+    ids=["non-thinking", "adaptive-thinking"],
+)
+@pytest.mark.parametrize("schema_kind", ["pydantic", "dict"])
+@pytest.mark.parametrize("has_tool_call", [True, False])
+@pytest.mark.parametrize("include_raw", [True, False])
+def test_structured_output_handles_model_without_forced_tools(
+    model_kwargs: dict[str, Any],
+    schema_kind: str,
+    has_tool_call: bool,
+    include_raw: bool,
+) -> None:
+    bind_kwargs: dict[str, Any] = {}
+
+    raw_message = AIMessage(
+        content="" if has_tool_call else "plain text",
+        tool_calls=(
+            [
+                {
+                    "name": "_StructuredResponse",
+                    "args": {"value": "ok"},
+                    "id": "call_test",
+                    "type": "tool_call",
+                }
+            ]
+            if has_tool_call
+            else []
+        ),
+    )
+
+    class _FakeChatLiteLLM(ChatLiteLLM):
+        def bind_tools(self, tools: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+            bind_kwargs.update(kwargs)
+            return RunnableLambda(lambda _: raw_message)
+
+    schema: Any = _StructuredResponse
+    if schema_kind == "dict":
+        schema = {
+            "type": "function",
+            "function": {
+                "name": "_StructuredResponse",
+                "description": "Return the requested value.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                },
+            },
+        }
+
+    llm = _FakeChatLiteLLM(
+        model="anthropic/claude-fable-5-1",
+        api_key="fake",
+        model_kwargs=model_kwargs,
+    )
+
+    with pytest.warns(
+        UserWarning,
+        match="does not support forced tool use",
+    ) as caught:
+        structured = llm.with_structured_output(
+            schema,
+            method="function_calling",
+            include_raw=include_raw,
+        )
+
+    assert "tool_choice" not in bind_kwargs
+    assert "disabling `thinking`" not in str(caught[0].message)
+
+    if not has_tool_call and not include_raw:
+        with pytest.raises(
+            OutputParserException,
+            match="no tool call is returned",
+        ):
+            structured.invoke("Return structured output.")
+        return
+
+    result = structured.invoke("Return structured output.")
+
+    if include_raw:
+        assert isinstance(result, dict)
+        assert result["raw"] is raw_message
+
+        if not has_tool_call:
+            assert result["parsed"] is None
+            assert isinstance(result["parsing_error"], OutputParserException)
+            return
+
+        assert result["parsing_error"] is None
+        parsed = result["parsed"]
+    else:
+        parsed = result
+
+    if schema_kind == "pydantic":
+        assert isinstance(parsed, _StructuredResponse)
+        assert parsed.value == "ok"
+    else:
+        assert parsed == {"value": "ok"}
+
+
+@pytest.mark.parametrize(
+    ("model", "model_kwargs"),
+    [
+        ("anthropic/claude-sonnet-4-5", _THINKING_KWARGS),
+        ("anthropic/claude-sonnet-4-5", {"reasoning_effort": "high"}),
+    ],
+    ids=["thinking", "effort"],
+)
+def test_with_structured_output_function_calling_warns_and_raises_for_claude_thinking(
+    model: str, model_kwargs: dict[str, Any]
+) -> None:
     """Claude thinking should not silently fall back to plain-text structured output."""
     bind_kwargs: dict[str, Any] = {}
 
@@ -455,11 +2238,7 @@ def test_with_structured_output_function_calling_warns_and_raises_for_claude_thi
             bind_kwargs.update(kwargs)
             return RunnableLambda(lambda _: AIMessage(content="plain text"))
 
-    llm = _FakeChatLiteLLM(
-        model="anthropic/claude-sonnet-4-20250514",
-        api_key="fake",
-        model_kwargs=_THINKING_KWARGS,
-    )
+    llm = _FakeChatLiteLLM(model=model, api_key="fake", model_kwargs=model_kwargs)
 
     with pytest.warns(UserWarning, match="Structured output via function calling"):
         structured = llm.with_structured_output(
@@ -471,6 +2250,26 @@ def test_with_structured_output_function_calling_warns_and_raises_for_claude_thi
         structured.invoke("Return structured output.")
 
 
+@pytest.mark.parametrize(
+    ("model", "model_kwargs"), _ADAPTIVE_THINKING, ids=_ADAPTIVE_THINKING_IDS
+)
+def test_with_structured_output_forces_its_tool_beside_adaptive_thinking(
+    model: str, model_kwargs: dict[str, Any]
+) -> None:
+    """Adaptive thinking accepts a forced tool, so function calling keeps forcing it."""
+    llm = ChatLiteLLM(model=model, api_key="fake", model_kwargs=model_kwargs)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        structured = llm.with_structured_output(
+            _StructuredResponse, method="function_calling"
+        )
+
+    assert not [w for w in caught if "Structured output" in str(w.message)]
+    bound = structured.first  # type: ignore[attr-defined]
+    assert bound.kwargs["tool_choice"] == "required"
+
+
 def test_with_structured_output_include_raw_preserves_raw_for_claude_thinking() -> None:
     """`include_raw` should surface the parsing error without dropping the raw message."""
 
@@ -479,7 +2278,7 @@ def test_with_structured_output_include_raw_preserves_raw_for_claude_thinking() 
             return RunnableLambda(lambda _: AIMessage(content="plain text"))
 
     llm = _FakeChatLiteLLM(
-        model="anthropic/claude-sonnet-4-20250514",
+        model="anthropic/claude-sonnet-4-5",
         api_key="fake",
         model_kwargs=_THINKING_KWARGS,
     )
@@ -555,6 +2354,27 @@ def test_get_ls_params_sets_ls_provider() -> None:
     assert params["ls_model_name"] == "my-deployment"
 
 
+def test_get_ls_params_honors_per_call_model_override() -> None:
+    """A per-call `model` kwarg must be reflected in traces.
+
+    `_generate` merges per-call kwargs over the default params, so a `model`
+    passed via `bind` or `invoke` is the model actually requested. Reporting
+    the constructor default instead misattributes the run.
+    """
+    llm = ChatLiteLLM(model="gpt-4", api_key="fake")
+    assert llm._get_ls_params(model="gpt-4o-mini")["ls_model_name"] == "gpt-4o-mini"
+
+    # The override also wins over an explicitly configured model_name.
+    llm_with_name = ChatLiteLLM(
+        model="gpt-4", model_name="my-deployment", api_key="fake"
+    )
+    params = llm_with_name._get_ls_params(model="gpt-4o-mini")
+    assert params["ls_model_name"] == "gpt-4o-mini"
+
+    # Without an override the configured model_name is still used.
+    assert llm_with_name._get_ls_params()["ls_model_name"] == "my-deployment"
+
+
 def test_metadata_versions() -> None:
     """Test that metadata reports the correct version info."""
     llm = ChatLiteLLM(model="gpt-4", api_key="fake")
@@ -604,6 +2424,64 @@ def test_convert_message_to_dict_strips_thinking_blocks() -> None:
     assert "redacted_thinking" not in types
     assert {"type": "text", "text": "hello"} in d["content"]
     assert d["reasoning_content"] == "internal reasoning"
+
+
+def test_convert_message_to_dict_strips_normalized_reasoning_blocks() -> None:
+    """Reasoning in langchain-core's standard shapes must not reach providers."""
+    msg = AIMessage(
+        content=[
+            {"type": "reasoning", "reasoning": "internal reasoning"},
+            {
+                "type": "non_standard",
+                "value": {"type": "redacted_thinking", "data": "encrypted"},
+            },
+            {"type": "non_standard", "value": {"type": "thinking", "thinking": "t"}},
+            {"type": "non_standard", "value": {"type": "citation", "id": "c"}},
+            {"type": "text", "text": "hello"},
+        ],
+    )
+    d = _convert_message_to_dict(msg)
+
+    assert d["content"] == [
+        {"type": "non_standard", "value": {"type": "citation", "id": "c"}},
+        {"type": "text", "text": "hello"},
+    ]
+
+
+def test_reasoning_round_trip_through_content_blocks() -> None:
+    """A reply stored as its standard content_blocks replays without reasoning content.
+
+    LangGraph and output_version="v1" consumers persist content_blocks, which
+    surface reasoning_content as a reasoning block; DeepSeek rejects that block
+    with "unknown variant `reasoning`, expected `text`".
+    """
+    reply = _convert_dict_to_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "internal reasoning",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        }
+    )
+    assert isinstance(reply, AIMessage)
+    stored = AIMessage(
+        content=reply.content_blocks,  # type: ignore[arg-type]
+        additional_kwargs=reply.additional_kwargs,
+        tool_calls=reply.tool_calls,
+    )
+    assert {"type": "reasoning", "reasoning": "internal reasoning"} in stored.content
+
+    d = _convert_message_to_dict(stored)
+
+    assert d["content"] == ""
+    assert d["reasoning_content"] == "internal reasoning"
+    assert [tc["id"] for tc in d["tool_calls"]] == ["call_1"]
 
 
 def test_convert_message_to_dict_plain_string_content() -> None:
@@ -722,3 +2600,1255 @@ def test_client_params_does_not_mutate_litellm_globals() -> None:
     assert params["api_key"] == "azure-key"
     assert params["organization"] == "my-org"
     assert params["extra_headers"] == {"X-Custom": "value"}
+
+
+def test_top_p_and_top_k_in_default_params() -> None:
+    """Test that top_p and top_k are included in _default_params and _client_params."""
+    llm = ChatLiteLLM(
+        model="gpt-4",
+        api_key="fake",
+        top_p=0.8,
+        top_k=40,
+    )
+    params = llm._default_params
+    assert params["top_p"] == 0.8
+    assert params["top_k"] == 40
+
+    client_params = llm._client_params
+    assert client_params["top_p"] == 0.8
+    assert client_params["top_k"] == 40
+
+
+def test_unset_top_p_and_top_k_are_absent_from_the_request() -> None:
+    """litellm rejects `top_k` for watsonx on key presence, not on its value.
+
+    Sending it as None fails every watsonx call before the request is built, from
+    callers that never touched the parameter.
+    """
+    llm = ChatLiteLLM(model="watsonx/ibm/granite-13b")
+    assert "top_p" not in llm._default_params
+    assert "top_k" not in llm._default_params
+
+
+def test_watsonx_accepts_what_this_model_sends_for_top_k() -> None:
+    """The rejection lives in litellm, so pin it there rather than trusting a key."""
+    llm = ChatLiteLLM(model="watsonx/ibm/granite-13b")
+
+    with pytest.raises(ValueError, match="top_k"):
+        litellm.utils.get_optional_params(
+            model="ibm/granite-13b", custom_llm_provider="watsonx", top_k=None
+        )
+    litellm.utils.get_optional_params(
+        model="ibm/granite-13b",
+        custom_llm_provider="watsonx",
+        **{k: v for k, v in llm._default_params.items() if k in ("top_p", "top_k")},
+    )
+
+
+# ── base_url / api_base alias ──────────────────────────────────────────────────
+
+
+def test_base_url_alias_sets_api_base() -> None:
+    """`base_url=` must populate `api_base`, matching the rest of the ecosystem.
+
+    Regression for #189: previously `base_url` was silently dropped by Pydantic's
+    `extra="ignore"`, so the endpoint override was never applied.
+    """
+    # `base_url` is a runtime alias normalized in `validate_environment`, not a
+    # declared field, hence the `call-arg` ignore.
+    llm = ChatLiteLLM(
+        model="gpt-4o-mini",
+        api_key="fake",
+        base_url="https://proxy.example/v1",  # type: ignore[call-arg]
+    )
+    assert llm.api_base == "https://proxy.example/v1"
+
+
+def test_api_base_still_supported() -> None:
+    """`api_base=` must keep working for existing callers (non-breaking)."""
+    llm = ChatLiteLLM(
+        model="gpt-4o-mini", api_key="fake", api_base="https://legacy.example/v1"
+    )
+    assert llm.api_base == "https://legacy.example/v1"
+
+
+def test_api_base_takes_precedence_over_base_url() -> None:
+    """When both are supplied, the explicit `api_base` wins.
+
+    Covers the precedence branch in `validate_environment` (#189): `base_url` is
+    only applied when `api_base` is unset, so the canonical field always wins.
+    """
+    llm = ChatLiteLLM(
+        model="gpt-4o-mini",
+        api_key="fake",
+        api_base="https://explicit.example/v1",
+        base_url="https://alias.example/v1",  # type: ignore[call-arg]
+    )
+    assert llm.api_base == "https://explicit.example/v1"
+
+
+def test_base_url_reaches_completion_call_once() -> None:
+    """The configured endpoint must reach the underlying completion call once.
+
+    Regression for #189: `base_url` is normalized to `api_base` and must be
+    forwarded to `litellm.completion` as `api_base` on a single call, with the
+    value unchanged (no duplication such as ``/v1/v1``).
+    """
+    llm = ChatLiteLLM(
+        model="gpt-4o-mini",
+        api_key="fake",
+        base_url="https://proxy.example/v1",  # type: ignore[call-arg]
+    )
+    mock_response = {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }
+    # Patch at the litellm boundary, not at `completion_with_retry`, which is the
+    # method that calls it -- otherwise the retry path is never exercised and the
+    # endpoint is never seen at the point it is actually sent.
+    with patch.object(
+        llm.client, "completion", return_value=mock_response
+    ) as mock_completion:
+        llm.invoke("hi")
+
+    mock_completion.assert_called_once()
+    assert mock_completion.call_args.kwargs["api_base"] == "https://proxy.example/v1"
+
+
+def test_init_chat_model_forwards_base_url() -> None:
+    """The generic factory path must forward `base_url` to LiteLLM.
+
+    `init_chat_model(model_provider="litellm", base_url=...)` is the exact path
+    from #189, since its docstring lists `base_url` as the common endpoint kwarg.
+
+    Skips (rather than fails) if a future `langchain` changes how the "litellm"
+    provider resolves, so this test stays a signal about *this* package's code
+    and not about the external provider registry.
+    """
+    # Resolve the provider first, without the kwarg under test. A failure here is
+    # about the external registry, so it skips; anything raised once base_url is
+    # added is this package's and must fail.
+    try:
+        init_chat_model("gpt-4o-mini", model_provider="litellm", api_key="fake")
+    except (ImportError, ValueError) as exc:
+        pytest.skip(f"init_chat_model could not resolve the litellm provider: {exc}")
+
+    llm = init_chat_model(
+        "gpt-4o-mini",
+        model_provider="litellm",
+        api_key="fake",
+        base_url="https://proxy.example/v1",
+    )
+
+    assert isinstance(llm, ChatLiteLLM)
+    assert llm.api_base == "https://proxy.example/v1"
+
+
+_STREAM_MOCK_OK = {
+    "choices": [
+        {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+    ],
+    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+}
+
+
+def test_stream_actually_streams_without_opting_in() -> None:
+    """`.stream()` must reach `_stream` for a caller who never mentioned streaming.
+
+    `@pre_init` hands pydantic a fully-populated dict, so every field read as
+    explicitly set. langchain-core treats an explicitly-set `streaming=False` as a
+    hard opt-out that overrides even the `stream=True` its own `.stream()` passes,
+    so `.stream()` silently fell back to `invoke()`.
+    """
+    llm = ChatLiteLLM(model="gpt-4o", api_key="k")
+    assert "streaming" not in llm.model_fields_set
+    assert llm._should_stream(async_api=False, stream=True) is True
+
+
+def test_explicit_streaming_false_still_opts_out() -> None:
+    """A caller who deliberately says `streaming=False` keeps the hard opt-out."""
+    llm = ChatLiteLLM(model="gpt-4o", api_key="k", streaming=False)
+    assert "streaming" in llm.model_fields_set
+    assert llm._should_stream(async_api=False, stream=True) is False
+
+
+def test_fields_set_distinguishes_a_chosen_streaming_flag_from_the_default() -> None:
+    """`streaming` is the one field langchain-core reads out of `model_fields_set`.
+
+    It treats a set `streaming=False` as a hard opt-out overriding a per-call
+    `stream=True`, so the default must not look chosen.
+    """
+    assert "streaming" not in ChatLiteLLM(model="gpt-4o", api_key="k").model_fields_set
+    assert "streaming" in ChatLiteLLM(model="gpt-4o", streaming=False).model_fields_set
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["model", "streaming", "max_retries", "model_kwargs", "disable_streaming"],
+)
+def test_an_explicit_none_falls_back_to_the_default(field: str) -> None:
+    """A config built from JSON or os.getenv carries nulls for unset values.
+
+    These fields are not Optional, so a None that reaches pydantic is rejected.
+    Dropping it leaves the default in place and, unlike backfilling the default,
+    keeps the field out of `model_fields_set` where langchain-core reads it.
+    """
+    kwargs: dict[str, Any] = {"model": "anthropic/claude-3-5-sonnet-20241022"}
+    kwargs[field] = None
+    llm = ChatLiteLLM(**kwargs)  # type: ignore[arg-type]
+
+    assert getattr(llm, field) == ChatLiteLLM.model_fields[field].get_default(
+        call_default_factory=True
+    )
+    assert field not in llm.model_fields_set
+
+
+def test_a_null_streaming_still_streams() -> None:
+    """`streaming=None` means unset, so it must not read as a chosen opt-out.
+
+    A type checker rejects this, which is why only config-driven callers hit it.
+    """
+    llm = ChatLiteLLM(model="gpt-4o", api_key="k", streaming=None)  # type: ignore[arg-type]
+
+    assert "streaming" not in llm.model_fields_set
+
+
+def test_a_validator_assigned_field_counts_as_set() -> None:
+    """`base_url` reaches `api_base` through a validator, so a round-trip keeps it.
+
+    `model_dump(exclude_unset=True)` is how a configuration is carried between
+    processes; dropping a field no kwarg named loses the endpoint the caller chose.
+    """
+    llm = ChatLiteLLM(
+        model="gpt-4",
+        api_key="k",
+        base_url="https://proxy.example/v1",  # type: ignore[call-arg]
+    )
+
+    config = llm.model_dump(exclude_unset=True)
+
+    assert config["api_base"] == "https://proxy.example/v1"
+    assert ChatLiteLLM(**config).api_base == "https://proxy.example/v1"
+
+
+def test_stream_false_is_not_overridden_by_a_streaming_instance() -> None:
+    """The non-streaming branch parses a mapping, so it must send stream=False."""
+    llm = ChatLiteLLM(model="gpt-4o", api_key="k", streaming=True)
+
+    with patch.object(
+        llm.client, "completion", return_value=_STREAM_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi", stream=False)
+
+    assert mock_completion.call_args.kwargs["stream"] is False
+
+
+def test_per_call_stream_options_are_not_discarded() -> None:
+    """`_stream` overwrote a per-call value with the instance one or the default."""
+    llm = ChatLiteLLM(model="gpt-4o", api_key="k", streaming=True)
+
+    def _chunks(**kwargs: Any) -> Any:
+        yield {
+            "choices": [
+                {"delta": {"role": "assistant", "content": "x"}, "finish_reason": None}
+            ]
+        }
+
+    with patch.object(llm.client, "completion", side_effect=_chunks) as mock_completion:
+        list(llm.stream("hi", stream_options={"include_usage": False}))
+
+    assert mock_completion.call_args.kwargs["stream_options"] == {
+        "include_usage": False
+    }
+
+
+@pytest.mark.asyncio
+async def test_astream_false_is_not_overridden_by_a_streaming_instance() -> None:
+    """The async twin of the branch that parses a mapping."""
+    llm = ChatLiteLLM(model="gpt-4o", api_key="k", streaming=True)
+
+    async def _response(**kwargs: Any) -> Any:
+        return _STREAM_MOCK_OK
+
+    with patch.object(
+        llm.client, "acompletion", side_effect=_response
+    ) as mock_completion:
+        await llm.ainvoke("hi", stream=False)
+
+    assert mock_completion.call_args.kwargs["stream"] is False
+
+
+@pytest.mark.asyncio
+async def test_per_call_stream_options_are_not_discarded_on_the_async_path() -> None:
+    """`_astream` carries the same caller configuration as `_stream`."""
+    llm = ChatLiteLLM(model="gpt-4o", api_key="k", streaming=True)
+
+    async def _chunks(**kwargs: Any) -> Any:
+        async def _aiter() -> Any:
+            yield {
+                "choices": [
+                    {
+                        "delta": {"role": "assistant", "content": "x"},
+                        "finish_reason": None,
+                    }
+                ]
+            }
+
+        return _aiter()
+
+    with patch.object(
+        llm.client, "acompletion", side_effect=_chunks
+    ) as mock_completion:
+        async for _ in llm.astream("hi", stream_options={"include_usage": False}):
+            pass
+
+    assert mock_completion.call_args.kwargs["stream_options"] == {
+        "include_usage": False
+    }
+
+
+def test_response_cost_reaches_response_metadata() -> None:
+    """Cost is what a caller aggregates across a workflow, so it must survive.
+
+    The deployment id does not travel with it here. Only a router picks a
+    deployment, so naming one on a direct call would report a choice nobody made.
+    """
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="k")
+    response = _MOCK_OK_WITH_COST()
+
+    with patch.object(llm.client, "completion", return_value=response):
+        message = llm.invoke("hi")
+
+    assert message.response_metadata["response_cost"] == 1.35e-05
+    assert "model_id" not in message.response_metadata
+
+
+def test_hidden_params_are_not_copied_wholesale() -> None:
+    """litellm puts api_base and the resolved request params in there too.
+
+    `response_metadata` reaches every trace and log, so only the named keys travel.
+    """
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="k")
+    response = _MOCK_OK_WITH_COST()
+
+    with patch.object(llm.client, "completion", return_value=response):
+        metadata = llm.invoke("hi").response_metadata
+
+    assert "api_base" not in metadata
+    assert "optional_params" not in metadata
+    assert "hidden_params" not in metadata
+
+
+def _MOCK_OK_WITH_COST() -> Any:
+    """A response shaped like litellm's, hidden params and all."""
+    from litellm.utils import Choices, Message, ModelResponse
+
+    response = ModelResponse(
+        id="x",
+        choices=[
+            Choices(
+                finish_reason="stop",
+                index=0,
+                message=Message(content="ok", role="assistant"),
+            )
+        ],
+        created=0,
+        model="gpt-4o-mini",
+        object="chat.completion",
+        usage={"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10},
+    )
+    response._hidden_params = {
+        "response_cost": 1.35e-05,
+        "model_id": "deployment-A",
+        "api_base": "https://api.openai.com",
+        "optional_params": {"temperature": 0.1},
+    }
+    return response
+
+
+def _streamed_chunks_with_cost() -> list:
+    """The shape a provider streams back: the cost trails the content."""
+    return [
+        {
+            "choices": [{"delta": {"role": "assistant", "content": "hel"}}],
+            "usage": None,
+        },
+        {
+            "choices": [{"delta": {"content": "lo"}, "finish_reason": "stop"}],
+            "usage": None,
+        },
+        {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 2,
+                "total_tokens": 7,
+                "cost": 2.4e-06,
+            },
+        },
+    ]
+
+
+def _merge(chunks: list) -> AIMessageChunk:
+    """Merge a stream the way a caller consuming it does."""
+    merged = chunks[0]
+    for chunk in chunks[1:]:
+        merged = merged + chunk
+    return merged
+
+
+def test_streamed_cost_reaches_response_metadata() -> None:
+    """A stream reports its cost on a trailing chunk that carries no content.
+
+    That chunk arrives with an empty `choices`, so a cost read only off content
+    chunks never surfaces at all.
+    """
+    llm = ChatLiteLLM(model="gpt-4", api_key="fake")
+
+    with patch.object(
+        ChatLiteLLM,
+        "completion_with_retry",
+        return_value=iter(_streamed_chunks_with_cost()),
+    ):
+        chunks = [chunk.message for chunk in llm._stream([])]
+
+    merged = _merge(chunks)
+    assert merged.response_metadata["response_cost"] == 2.4e-06
+    assert "model_id" not in merged.response_metadata
+
+
+async def test_astreamed_cost_reaches_response_metadata() -> None:
+    """Async streaming must surface the cost the sync path surfaces."""
+    llm = ChatLiteLLM(model="gpt-4", api_key="fake")
+
+    async def _fake_async_stream() -> Any:
+        for chunk in _streamed_chunks_with_cost():
+            yield chunk
+
+    with patch.object(
+        ChatLiteLLM,
+        "acompletion_with_retry",
+        new=AsyncMock(return_value=_fake_async_stream()),
+    ):
+        chunks = [chunk.message async for chunk in llm._astream([])]
+
+    assert _merge(chunks).response_metadata["response_cost"] == 2.4e-06
+
+
+def _chunks_costing_twice() -> list:
+    """A provider that attaches usage, and so a cost, to content chunks.
+
+    langchain raises on two differing floats under one key, so a stream that
+    names its cost on more than one chunk cannot be merged at all.
+    """
+    return [
+        {
+            "choices": [{"delta": {"role": "assistant", "content": "hel"}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "cost": 1.0e-06},
+        },
+        {
+            "choices": [{"delta": {"content": "lo"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "cost": 2.4e-06},
+        },
+    ]
+
+
+def test_a_streamed_cost_is_named_once() -> None:
+    """The merge a caller performs must survive a provider that reports twice."""
+    llm = ChatLiteLLM(model="gpt-4", api_key="fake")
+
+    with patch.object(
+        ChatLiteLLM, "completion_with_retry", return_value=iter(_chunks_costing_twice())
+    ):
+        chunks = [chunk.message for chunk in llm._stream([])]
+
+    naming = [c for c in chunks if "response_cost" in c.response_metadata]
+    assert len(naming) == 1
+    assert _merge(chunks).response_metadata["response_cost"] == 1.0e-06
+
+
+async def test_an_astreamed_cost_is_named_once() -> None:
+    """The async path merges the same way, so it needs the same guarantee."""
+    llm = ChatLiteLLM(model="gpt-4", api_key="fake")
+
+    async def _fake_async_stream() -> Any:
+        for chunk in _chunks_costing_twice():
+            yield chunk
+
+    with patch.object(
+        ChatLiteLLM,
+        "acompletion_with_retry",
+        new=AsyncMock(return_value=_fake_async_stream()),
+    ):
+        chunks = [chunk.message async for chunk in llm._astream([])]
+
+    naming = [c for c in chunks if "response_cost" in c.response_metadata]
+    assert len(naming) == 1
+    assert _merge(chunks).response_metadata["response_cost"] == 1.0e-06
+
+
+_USAGE = {"prompt_tokens": 12, "completion_tokens": 12, "total_tokens": 24}
+
+
+def _collect(llm: Any, mode: str) -> AIMessageChunk:
+    """``llm``'s reply streamed through ``mode``, merged the way a caller merges it."""
+    if mode == "stream":
+        return _merge(list(llm.stream("hi")))
+
+    async def collect() -> list[Any]:
+        return [chunk async for chunk in llm.astream("hi")]
+
+    return _merge(asyncio.run(collect()))
+
+
+@pytest.mark.parametrize("mode", ["stream", "astream"])
+def test_a_streamed_reply_costs_what_the_invoked_reply_costs(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Through real litellm, which puts the cost on a stream's usage chunk from 1.101.0.
+
+    Hand-built chunks carry a cost whatever litellm sends, so they cannot show it.
+    """
+    serve_http(
+        monkeypatch,
+        chat_completion_reply("Hi", usage=_USAGE),
+        chat_completion_events("Hi", _USAGE),
+    )
+    llm = ChatLiteLLM(model="openai/gpt-4o-mini", api_key="k")
+
+    invoked = llm.invoke("hi").response_metadata["response_cost"]
+
+    assert invoked > 0
+    assert _collect(llm, mode).response_metadata["response_cost"] == invoked
+
+
+def test_cost_is_read_from_either_shape_litellm_hands_over() -> None:
+    """The streaming path dumps a chunk to a dict; the router path leaves the model.
+
+    Reading one shape alone drops the cost on whichever path is not tested.
+    """
+    from types import SimpleNamespace
+
+    as_dict = {"usage": {"cost": 2.4e-06}}
+    as_model = SimpleNamespace(usage=SimpleNamespace(cost=2.4e-06))
+
+    assert _stream_cost_metadata(as_dict) == {"response_cost": 2.4e-06}
+    assert _stream_cost_metadata(as_model) == {"response_cost": 2.4e-06}
+
+    # A complete response holds the settled figure; `usage` is the fallback.
+    both = {"_hidden_params": {"response_cost": 1.0}, "usage": {"cost": 2.0}}
+    assert _cost_metadata(both) == {"response_cost": 1.0}
+
+
+def test_a_stream_chunk_names_only_the_cost_on_its_usage() -> None:
+    """A Router fallback copies a 0.0 priced before any token into every chunk."""
+    fell_back = {"_hidden_params": {"response_cost": 0.0}, "usage": {"cost": 9e-06}}
+
+    assert _stream_cost_metadata(fell_back) == {"response_cost": 9e-06}
+    # Any figure there is ignored, so a check that skips only a falsy 0.0 fails too.
+    both = {"_hidden_params": {"response_cost": 1.0}, "usage": {"cost": 2.0}}
+    assert _stream_cost_metadata(both) == {"response_cost": 2.0}
+    assert _stream_cost_metadata({"_hidden_params": {"response_cost": 0.0}}) == {}
+
+
+def test_a_zero_cost_is_a_figure_rather_than_an_absence() -> None:
+    """A free call costs 0.0, and a truthiness check would report it as unknown."""
+    assert _cost_metadata({"usage": {"cost": 0.0}}) == {"response_cost": 0.0}
+    assert _stream_cost_metadata({"usage": {"cost": 0.0}}) == {"response_cost": 0.0}
+
+
+def test_a_response_that_names_no_cost_adds_no_key() -> None:
+    """A key present and None reads as a real figure of zero value downstream."""
+    assert _cost_metadata({}) == {}
+    assert _cost_metadata({"usage": None, "_hidden_params": {}}) == {}
+    assert _stream_cost_metadata({"usage": None}) == {}
+
+
+def test_credentials_are_not_shown_in_repr() -> None:
+    """A key in repr() reaches logs and tracebacks."""
+    llm = ChatLiteLLM(
+        model="gpt-4o",
+        api_key="sk-generic",
+        openai_api_key="sk-openai",
+        azure_api_key="sk-azure",
+        anthropic_api_key="sk-anthropic",
+        replicate_api_key="sk-replicate",
+        cohere_api_key="sk-cohere",
+        openrouter_api_key="sk-openrouter",
+    )
+    assert "sk-" not in repr(llm)
+
+
+def test_every_credential_field_is_kept_out_of_repr() -> None:
+    """A provider added later must not arrive without the same protection."""
+    for name, field in ChatLiteLLM.model_fields.items():
+        if name in ("api_key", "extra_headers") or name.endswith("_api_key"):
+            assert field.repr is False, name
+
+
+def test_a_token_in_extra_headers_is_not_shown_in_repr() -> None:
+    """`extra_headers` is how a caller reaches a gateway, so it carries a token."""
+    llm = ChatLiteLLM(
+        model="gpt-4o",
+        extra_headers={"Authorization": "Bearer sk-should-not-appear"},
+    )
+    assert "sk-should-not-appear" not in repr(llm)
+
+
+def test_copying_model_kwargs_preserves_the_container_type() -> None:
+    """A caller's defaultdict must not come back as a plain dict.
+
+    `model_kwargs` is the escape hatch for provider payloads, so the type the
+    caller chose is part of the value.
+    """
+    llm = ChatLiteLLM(
+        model="gpt-4o",
+        api_key="k",
+        model_kwargs={"cfg": defaultdict(list), "ord": OrderedDict(b=2)},
+    )
+
+    params = llm._default_params
+
+    assert isinstance(params["cfg"], defaultdict)
+    assert params["cfg"]["missing"] == []
+    assert isinstance(params["ord"], OrderedDict)
+
+
+def test_a_self_referential_model_kwarg_does_not_recurse_forever() -> None:
+    """Copying has to terminate on a value that contains itself."""
+    cyclic: dict[str, Any] = {}
+    cyclic["self"] = cyclic
+    llm = ChatLiteLLM(model="gpt-4o", api_key="k", model_kwargs={"c": cyclic})
+
+    copied = llm._default_params["c"]
+
+    assert copied is not cyclic
+    assert copied["self"] is copied
+
+
+def test_a_non_mapping_input_raises_a_validation_error() -> None:
+    """The validator's guard must hand pydantic the bad input, not crash inside it."""
+    with pytest.raises(ValidationError):
+        ChatLiteLLM.model_validate([1, 2])
+
+
+def test_client_params_does_not_alias_model_kwargs() -> None:
+    """A caller mutating the returned params must not reach back into the model."""
+    llm = ChatLiteLLM(
+        model="gpt-4o",
+        api_key="k",
+        model_kwargs={"top": {"nested": {"a": 1}}, "items": [{"b": 2}]},
+    )
+    params = llm._client_params
+    params["top"]["nested"]["a"] = 999
+    params["items"][0]["b"] = 999
+
+    # Copying only the first level would leave both of these aliased.
+    assert llm.model_kwargs["top"]["nested"]["a"] == 1
+    assert llm.model_kwargs["items"][0]["b"] == 2
+
+
+def test_constructor_signature_is_not_erased(tmp_path: Path) -> None:
+    """Nothing may replace pydantic's synthesized `__init__`.
+
+    An override taking `**kwargs` silently stops type checkers flagging an unknown
+    or mistyped field, and only a type checker can see it: the two are identical at
+    runtime.
+    """
+    pytest.importorskip("mypy")
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "from langchain_litellm import ChatLiteLLM\n"
+        "ChatLiteLLM(not_a_real_field=1)\n"
+        "ChatLiteLLM(temperature='warm')\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "mypy", "--no-incremental", str(probe)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert "call-arg" in result.stdout, result.stdout
+    assert "arg-type" in result.stdout, result.stdout
+
+
+# ── finish_reason in streamed response_metadata ───────────────────────────────
+
+
+def test_stream_sets_finish_reason_in_response_metadata() -> None:
+    """The chunk carrying finish_reason must surface it in response_metadata."""
+    llm = ChatLiteLLM(model="gpt-4", api_key="fake")
+    fake_chunks = [
+        {
+            "choices": [{"delta": {"role": "assistant", "content": "hel"}}],
+            "usage": None,
+        },
+        {
+            "choices": [{"delta": {"content": "lo"}, "finish_reason": "stop"}],
+            "usage": None,
+        },
+        {
+            "choices": [],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+        },
+    ]
+
+    with patch.object(
+        ChatLiteLLM, "completion_with_retry", return_value=iter(fake_chunks)
+    ):
+        chunks = list(llm._stream([]))
+
+    assert chunks[0].message.response_metadata.get("finish_reason") is None
+    assert chunks[1].message.response_metadata.get("finish_reason") == "stop"
+
+
+async def test_astream_sets_finish_reason_in_response_metadata() -> None:
+    """Async streaming must also surface finish_reason in response_metadata."""
+    llm = ChatLiteLLM(model="gpt-4", api_key="fake")
+    fake_chunks = [
+        {
+            "choices": [{"delta": {"role": "assistant", "content": "hel"}}],
+            "usage": None,
+        },
+        {
+            "choices": [{"delta": {"content": "lo"}, "finish_reason": "stop"}],
+            "usage": None,
+        },
+        {
+            "choices": [],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+        },
+    ]
+
+    async def _fake_async_stream():
+        for c in fake_chunks:
+            yield c
+
+    with patch.object(
+        ChatLiteLLM,
+        "acompletion_with_retry",
+        new=AsyncMock(return_value=_fake_async_stream()),
+    ):
+        chunks = [chunk async for chunk in llm._astream([])]
+
+    assert chunks[0].message.response_metadata.get("finish_reason") is None
+    assert chunks[1].message.response_metadata.get("finish_reason") == "stop"
+
+
+# ── response-level provider_specific_fields ────────────────────────────────────
+
+
+def test_stream_root_provider_specific_fields_in_response_metadata() -> None:
+    """Response-level fields go to response_metadata, where invoke puts them."""
+    llm = ChatLiteLLM(model="gpt-4", api_key="fake")
+    citations = {"citations": [{"source": "Wikipedia"}]}
+    fake_chunks = [
+        {
+            "choices": [{"delta": {"role": "assistant", "content": "hi"}}],
+            "usage": None,
+            "provider_specific_fields": citations,
+        },
+        {
+            "choices": [],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+        },
+    ]
+    with patch.object(
+        ChatLiteLLM, "completion_with_retry", return_value=iter(fake_chunks)
+    ):
+        chunks = list(llm._stream([]))
+
+    first = chunks[0].message
+    assert first.response_metadata["provider_specific_fields"] == citations
+    assert "provider_specific_fields" not in first.additional_kwargs
+
+
+def test_stream_keeps_delta_provider_specific_fields_apart_from_root_ones() -> None:
+    """A delta's own fields stay in additional_kwargs beside the response's."""
+    llm = ChatLiteLLM(model="gpt-4", api_key="fake")
+    citations = {"citations": [{"source": "Wikipedia"}]}
+    own = {"thought_signature": "sig"}
+    fake_chunks = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "role": "assistant",
+                        "content": "hi",
+                        "provider_specific_fields": own,
+                    }
+                }
+            ],
+            "usage": None,
+            "provider_specific_fields": citations,
+        },
+    ]
+    with patch.object(
+        ChatLiteLLM, "completion_with_retry", return_value=iter(fake_chunks)
+    ):
+        chunks = list(llm._stream([]))
+
+    message = chunks[0].message
+    assert message.additional_kwargs["provider_specific_fields"] == own
+    assert message.response_metadata["provider_specific_fields"] == citations
+
+
+def test_stream_vertex_grounding_metadata_in_response_metadata() -> None:
+    """Vertex grounding metadata takes the same response-level place."""
+    llm = ChatLiteLLM(model="gemini/gemini-2.5-flash", api_key="fake")
+    grounding = [{"webSearchQueries": ["tallest mountain"]}]
+    fake_chunks = [
+        {
+            "choices": [{"delta": {"role": "assistant", "content": "hi"}}],
+            "usage": None,
+            "vertex_ai_grounding_metadata": grounding,
+        },
+    ]
+    with patch.object(
+        ChatLiteLLM, "completion_with_retry", return_value=iter(fake_chunks)
+    ):
+        chunks = list(llm._stream([]))
+
+    assert chunks[0].message.response_metadata["provider_specific_fields"] == grounding
+
+
+def test_stream_root_metadata_on_later_chunk_survives_aggregation() -> None:
+    """Fields on a later chunk survive the merge beside the first chunk's."""
+    llm = ChatLiteLLM(model="gpt-4", api_key="fake")
+    citations = {"citations": [{"source": "docs"}]}
+    fake_chunks = [
+        {"choices": [{"delta": {"role": "assistant", "content": "a"}}], "usage": None},
+        {
+            "choices": [{"delta": {"content": "b"}}],
+            "usage": None,
+            "provider_specific_fields": citations,
+        },
+    ]
+    with patch.object(
+        ChatLiteLLM, "completion_with_retry", return_value=iter(fake_chunks)
+    ):
+        chunks = list(llm._stream([]))
+
+    merged = chunks[0].message + chunks[1].message
+    assert merged.response_metadata["provider_specific_fields"] == citations
+    assert merged.response_metadata["model_provider"] == "litellm"
+
+
+async def test_astream_root_provider_specific_fields_in_response_metadata() -> None:
+    """Async streaming places them the same way."""
+    llm = ChatLiteLLM(model="gpt-4", api_key="fake")
+    citations = {"citations": [{"source": "Wikipedia"}]}
+    fake_chunks = [
+        {
+            "choices": [{"delta": {"role": "assistant", "content": "hi"}}],
+            "usage": None,
+            "provider_specific_fields": citations,
+        },
+    ]
+
+    async def _fake_async_stream():
+        for c in fake_chunks:
+            yield c
+
+    with patch.object(
+        ChatLiteLLM,
+        "acompletion_with_retry",
+        new=AsyncMock(return_value=_fake_async_stream()),
+    ):
+        chunks = [chunk async for chunk in llm._astream([])]
+
+    first = chunks[0].message
+    assert first.response_metadata["provider_specific_fields"] == citations
+    assert "provider_specific_fields" not in first.additional_kwargs
+
+
+_GROUNDING = {
+    "webSearchQueries": ["tallest mountain"],
+    "groundingChunks": [{"web": {"uri": "https://example.com", "title": "example"}}],
+}
+
+
+@pytest.mark.parametrize("method", ["invoke", "ainvoke", "stream", "astream"])
+async def test_grounding_reaches_response_metadata_streamed_or_not(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """Gemini's grounding is in response_metadata however the reply is read."""
+    reply = gemini_reply("Everest.", _GROUNDING)
+    serve_http(monkeypatch, reply, [reply])
+    llm = ChatLiteLLM(model="gemini/gemini-2.5-flash", api_key="k")
+
+    message = await whole_reply(llm, method)
+
+    assert message.response_metadata["provider_specific_fields"] == [_GROUNDING]
+    assert "provider_specific_fields" not in message.additional_kwargs
+
+
+# ── Responses API routing ──────────────────────────────────────────────────────
+
+# A minimal Responses API reply, shaped by the openai SDK's `Response` type.
+_RESPONSES_API_REPLY = {
+    "id": "resp_1",
+    "object": "response",
+    "created_at": 0,
+    "status": "completed",
+    "model": "gpt-4o-mini",
+    "output": [
+        {
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "ok", "annotations": []}],
+        }
+    ],
+    "parallel_tool_calls": True,
+    "tool_choice": "auto",
+    "tools": [],
+    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+}
+
+
+# Only newer litellm releases serve Bedrock Mantle over the Responses API.
+_MANTLE_SERVES_RESPONSES = (
+    litellm.utils.ProviderConfigManager.get_provider_responses_api_config(
+        provider="bedrock_mantle", model="openai.gpt-oss-120b"
+    )
+    is not None
+)
+
+
+@pytest.fixture
+def _responses_endpoint(monkeypatch: pytest.MonkeyPatch) -> list[httpx.Request]:
+    """Answer each synchronous request litellm sends, in-process, as Responses would.
+
+    Endpoint overrides in the developer's environment would redirect the requests.
+    """
+    for name in ("OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENROUTER_API_BASE"):
+        monkeypatch.delenv(name, raising=False)
+    requests: list[httpx.Request] = []
+
+    def _reply(_: httpx.HTTPTransport, request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_RESPONSES_API_REPLY)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _reply)
+    return requests
+
+
+@pytest.mark.parametrize(
+    ("model", "config", "endpoint", "provider_model"),
+    [
+        ("gpt-4o-mini", {}, "https://api.openai.com/v1/responses", "gpt-4o-mini"),
+        (
+            "openai/gpt-4o-mini",
+            {},
+            "https://api.openai.com/v1/responses",
+            "gpt-4o-mini",
+        ),
+        (
+            "fake-model",
+            {"custom_llm_provider": "openai"},
+            "https://api.openai.com/v1/responses",
+            "fake-model",
+        ),
+        (
+            "fake-model",
+            {"api_base": "https://api.perplexity.ai"},
+            "https://api.perplexity.ai/v1/responses",
+            "fake-model",
+        ),
+        (
+            "openrouter/openai/gpt-4o-mini",
+            {},
+            "https://openrouter.ai/api/v1/responses",
+            "openai/gpt-4o-mini",
+        ),
+        (
+            "fake-deployment",
+            {
+                "custom_llm_provider": "azure",
+                "api_base": "https://fake.openai.azure.com",
+                "model_kwargs": {"api_version": "preview"},
+            },
+            "https://fake.openai.azure.com/openai/v1/responses?api-version=preview",
+            "fake-deployment",
+        ),
+        pytest.param(
+            "bedrock_mantle/openai.gpt-oss-120b",
+            {"model_kwargs": {"aws_region_name": "us-east-1"}},
+            "https://bedrock-mantle.us-east-1.api.aws/v1/responses",
+            "openai.gpt-oss-120b",
+            marks=pytest.mark.skipif(
+                not _MANTLE_SERVES_RESPONSES,
+                reason="this litellm serves no Responses API for Bedrock Mantle",
+            ),
+        ),
+    ],
+)
+def test_use_responses_api_sends_the_call_to_the_responses_endpoint(
+    _responses_endpoint: list[httpx.Request],
+    model: str,
+    config: dict[str, Any],
+    endpoint: str,
+    provider_model: str,
+) -> None:
+    """litellm's own bridge decides the route, so the wire is where to look.
+
+    The routing name stays out of the reply, which tracing reads.
+    """
+    llm = ChatLiteLLM(model=model, api_key="k", use_responses_api=True, **config)
+
+    message = llm.invoke("hi")
+
+    assert [str(request.url) for request in _responses_endpoint] == [endpoint]
+    assert json.loads(_responses_endpoint[0].content)["model"] == provider_model
+    assert message.content == "ok"
+    assert message.response_metadata["model_name"] == model
+
+
+class _Sent(Exception):
+    """Stops a call once litellm has received it."""
+
+
+async def test_use_responses_api_routes_every_entry_point() -> None:
+    """A route applied in one entry point leaves the others on Chat Completions."""
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="k", use_responses_api=True)
+
+    with (
+        patch.object(llm.client, "completion", side_effect=_Sent) as completion,
+        patch.object(llm.client, "acompletion", side_effect=_Sent) as acompletion,
+    ):
+        with pytest.raises(_Sent):
+            llm.invoke("hi")
+        with pytest.raises(_Sent):
+            list(llm.stream("hi"))
+        with pytest.raises(_Sent):
+            await llm.ainvoke("hi")
+        with pytest.raises(_Sent):
+            [chunk async for chunk in llm.astream("hi")]
+
+    calls = completion.call_args_list + acompletion.call_args_list
+    assert [call.kwargs["model"] for call in calls] == [
+        "openai/responses/gpt-4o-mini"
+    ] * 4
+
+
+@pytest.mark.parametrize(
+    ("override", "routed"),
+    [
+        (
+            {"model": "openrouter/openai/gpt-4o-mini"},
+            "openrouter/responses/openai/gpt-4o-mini",
+        ),
+        (
+            {"model": "fake-deployment", "custom_llm_provider": "azure"},
+            "azure/responses/fake-deployment",
+        ),
+        ({"model": None}, "openai/responses/gpt-4o-mini"),
+        ({"model": "openai/responses/gpt-4o-mini"}, "openai/responses/gpt-4o-mini"),
+    ],
+)
+def test_use_responses_api_routes_the_destination_a_call_settles_on(
+    override: dict[str, Any], routed: str
+) -> None:
+    """A per-call destination is routed, and a None override keeps the configured one."""
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="k", use_responses_api=True)
+
+    with patch.object(llm.client, "completion", return_value=_MOCK_OK) as completion:
+        llm.invoke("hi", **override)
+
+    assert completion.call_args.kwargs["model"] == routed
+
+
+@pytest.mark.parametrize(
+    ("config", "call", "sent"),
+    [
+        ({}, {"use_responses_api": True}, "openai/responses/gpt-4o-mini"),
+        ({"use_responses_api": True}, {"use_responses_api": False}, "gpt-4o-mini"),
+        (
+            {"use_responses_api": True},
+            {"use_responses_api": None},
+            "openai/responses/gpt-4o-mini",
+        ),
+        (
+            {"model_kwargs": {"use_responses_api": True}},
+            {},
+            "openai/responses/gpt-4o-mini",
+        ),
+        (
+            {"model_kwargs": {"use_responses_api": True}},
+            {"use_responses_api": None},
+            "openai/responses/gpt-4o-mini",
+        ),
+    ],
+)
+def test_use_responses_api_is_read_like_a_destination_and_never_sent(
+    config: dict[str, Any], call: dict[str, Any], sent: str
+) -> None:
+    """The flag picks the route the way ``model`` does, so it is no litellm param."""
+    llm = ChatLiteLLM(model="gpt-4o-mini", api_key="k", **config)
+
+    with patch.object(llm.client, "completion", return_value=_MOCK_OK) as completion:
+        llm.invoke("hi", **call)
+
+    assert completion.call_args.kwargs["model"] == sent
+    assert "use_responses_api" not in completion.call_args.kwargs
+
+
+def test_use_responses_api_keeps_its_own_cache_entries() -> None:
+    """A cached Chat Completions reply must not answer a call meant for Responses."""
+    cache = InMemoryCache()
+    plain = ChatLiteLLM(model="gpt-4o-mini", api_key="k", cache=cache)
+    routed = ChatLiteLLM(
+        model="gpt-4o-mini", api_key="k", cache=cache, use_responses_api=True
+    )
+
+    with patch.object(plain.client, "completion", return_value=_MOCK_OK) as completion:
+        plain.invoke("hi")
+        routed.invoke("hi")
+
+    assert [call.kwargs["model"] for call in completion.call_args_list] == [
+        "gpt-4o-mini",
+        "openai/responses/gpt-4o-mini",
+    ]
+
+
+def test_use_previous_response_id_keeps_its_own_cache_entries() -> None:
+    """A flag-off cached reply must not answer a call that chains Responses turns."""
+    cache = InMemoryCache()
+    plain = ChatLiteLLM(model="gpt-4o-mini", api_key="k", cache=cache)
+    chained = ChatLiteLLM(
+        model="gpt-4o-mini",
+        api_key="k",
+        cache=cache,
+        use_previous_response_id=True,
+    )
+
+    with patch.object(plain.client, "completion", return_value=_MOCK_OK) as completion:
+        plain.invoke("hi")
+        chained.invoke("hi")
+
+    assert [call.kwargs["model"] for call in completion.call_args_list] == [
+        "gpt-4o-mini",
+        "openai/responses/gpt-4o-mini",
+    ]
+
+
+def test_use_responses_api_refuses_a_provider_without_one() -> None:
+    """litellm would answer over Anthropic's chat API, never reaching a Responses API."""
+    llm = ChatLiteLLM(
+        model="anthropic/claude-3-5-sonnet-20241022",
+        api_key="k",
+        use_responses_api=True,
+    )
+
+    with (
+        patch.object(llm.client, "completion") as completion,
+        pytest.raises(ValueError) as exc_info,
+    ):
+        llm.invoke("hi")
+
+    assert str(exc_info.value) == (
+        "use_responses_api=True, but litellm cannot send "
+        "'anthropic/claude-3-5-sonnet-20241022' to a Responses API. Use a model "
+        "litellm sends to a Responses API, or disable use_responses_api."
+    )
+    completion.assert_not_called()
+
+
+def test_use_previous_response_id_refusal_explains_unsupported_model() -> None:
+    """The error names the unsupported route and a working alternative."""
+    llm = ChatLiteLLM(
+        model="anthropic/claude-3-5-sonnet-20241022",
+        api_key="k",
+        use_previous_response_id=True,
+    )
+
+    with (
+        patch.object(llm.client, "completion") as completion,
+        pytest.raises(ValueError) as exc_info,
+    ):
+        llm.invoke("hi")
+
+    assert str(exc_info.value) == (
+        "use_previous_response_id=True, but litellm cannot send "
+        "'anthropic/claude-3-5-sonnet-20241022' to a Responses API. Chain an "
+        "OpenAI or Azure Responses model, or drop use_previous_response_id to "
+        "send the full history."
+    )
+    completion.assert_not_called()
+
+
+def test_use_responses_api_refuses_a_name_litellm_would_not_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """litellm bridges only a routed name its model map leaves unresolved.
+
+    Resolved to a chat model, the name would go to Chat Completions as the model id.
+    """
+    monkeypatch.setitem(
+        litellm.model_cost,
+        "openrouter/responses/fake-model",
+        {"mode": "chat", "litellm_provider": "openrouter"},
+    )
+    llm = ChatLiteLLM(
+        model="openrouter/fake-model", api_key="k", use_responses_api=True
+    )
+
+    with (
+        patch.object(llm.client, "completion") as completion,
+        pytest.raises(ValueError, match="cannot send"),
+    ):
+        llm.invoke("hi")
+
+    completion.assert_not_called()
+
+
+@pytest.mark.parametrize("name", ["proxy_base_url", "openai_api_base"])
+def test_an_endpoint_under_another_name_warns_and_is_ignored(name: str) -> None:
+    """Those names are not ChatLiteLLM's, so the endpoint never reached litellm."""
+    endpoint: dict[str, Any] = {name: "https://proxy.example/v1"}
+    with pytest.warns(UserWarning, match=f"ChatLiteLLM ignores '{name}'.*api_base"):
+        llm = ChatLiteLLM(model="gpt-4o-mini", api_key="fake", **endpoint)
+
+    assert llm.api_base is None
+
+
+@pytest.mark.parametrize("name", ["proxy_base_url", "openai_api_base"])
+def test_an_unset_endpoint_under_another_name_is_quiet(name: str) -> None:
+    """A config built from os.getenv carries None for an unset value."""
+    unset: dict[str, Any] = {name: None}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        llm = ChatLiteLLM(model="gpt-4o-mini", api_key="fake", **unset)
+
+    assert llm.api_base is None
+
+
+def test_the_router_warning_names_the_router() -> None:
+    with pytest.warns(UserWarning, match="ChatLiteLLMRouter ignores 'proxy_base_url'"):
+        ChatLiteLLMRouter(router=make_router(), proxy_base_url="https://proxy.example")
+
+
+def test_a_per_call_base_url_overrides_the_constructor_api_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """base_url is read at construction only; per call it goes to litellm as is,
+    and litellm prefers it over api_base."""
+    requests = serve_http(monkeypatch, chat_completion_reply("hi"))
+    llm = ChatLiteLLM(
+        model="openai/gpt-4o-mini",
+        api_key="fake",
+        api_base="https://constructor.example/v1",
+    )
+
+    llm.invoke("hi", base_url="https://call.example/v1")
+
+    assert requests[-1].url.host == "call.example"

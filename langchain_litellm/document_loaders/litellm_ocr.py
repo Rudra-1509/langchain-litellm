@@ -5,11 +5,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import mimetypes
+import os
 import time
+import warnings
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Literal, Optional
+from typing import Any, Literal
 
 import httpx
+from langchain_core._api.deprecation import LangChainDeprecationWarning
 from langchain_core.document_loaders import BaseLoader
 from langchain_core.documents import Document
 
@@ -22,9 +26,13 @@ class LiteLLMOCRLoader(BaseLoader):
     handles all provider-specific authentication and configuration.
 
     Args:
-        proxy_base_url: Base URL of the LiteLLM proxy server.
+        api_base: Base URL of the LiteLLM proxy server.
             Defaults to "http://localhost:4000".
-        api_key: Optional bearer token for proxy authentication.
+        base_url: Alias for ``api_base``; ``api_base`` wins when both are given.
+        proxy_base_url: Deprecated alias for ``api_base``, used only when neither
+            ``api_base`` nor ``base_url`` is given.
+        api_key: Optional bearer token for proxy authentication. Falls back to the
+            ``LITELLM_OCR_API_KEY`` environment variable; pass ``""`` to send none.
         model: Model name configured in the proxy (e.g., "azure-document").
             Defaults to "azure-document".
         file_path: Path to a local file to process.
@@ -60,7 +68,7 @@ class LiteLLMOCRLoader(BaseLoader):
 
         ```python
         loader = LiteLLMOCRLoader(
-            proxy_base_url="https://my-proxy.com",
+            api_base="https://my-proxy.com",
             api_key="my-bearer-token",
             file_path="/path/to/document.pdf",
             model="azure-document",
@@ -73,13 +81,15 @@ class LiteLLMOCRLoader(BaseLoader):
     def __init__(
         self,
         *,
-        proxy_base_url: str = "http://localhost:4000",
-        api_key: Optional[str] = None,
+        api_base: str | None = None,
+        base_url: str | None = None,
+        proxy_base_url: str | None = None,
+        api_key: str | None = None,
         model: str = "azure-document",
-        file_path: Optional[str] = None,
-        url_path: Optional[str] = None,
-        base64_content: Optional[str] = None,
-        bytes_content: Optional[bytes] = None,
+        file_path: str | None = None,
+        url_path: str | None = None,
+        base64_content: str | None = None,
+        bytes_content: bytes | None = None,
         mode: Literal["single", "page"] = "single",
         timeout: float = 300.0,
         max_retries: int = 3,
@@ -87,7 +97,12 @@ class LiteLLMOCRLoader(BaseLoader):
         """Initialize the LiteLLM OCR loader."""
         # Validate input sources
         input_sources = [file_path, url_path, base64_content, bytes_content]
-        provided_sources = [s for s in input_sources if s is not None]
+        # Count what the caller NAMED, so naming two is ambiguous even when one is
+        # empty, then reject an empty one rather than failing later at load().
+        named_sources = [s for s in input_sources if s is not None]
+        provided_sources = [s for s in named_sources if s]
+        if len(named_sources) > 1:
+            provided_sources = named_sources
 
         if len(provided_sources) == 0:
             raise ValueError(
@@ -105,11 +120,28 @@ class LiteLLMOCRLoader(BaseLoader):
         if mode not in ("single", "page"):
             raise ValueError(f"mode must be 'single' or 'page', got: {mode}")
 
-        # Validate proxy URL format
-        if not proxy_base_url.startswith(("http://", "https://")):
+        if proxy_base_url is not None:
+            warnings.warn(
+                "'proxy_base_url' is deprecated; use 'api_base' instead.",
+                LangChainDeprecationWarning,
+                stacklevel=2,
+            )
+        # The first name given wins; the error names it, so it points at the caller.
+        name, endpoint = next(
+            (
+                (name, value)
+                for name, value in (
+                    ("api_base", api_base),
+                    ("base_url", base_url),
+                    ("proxy_base_url", proxy_base_url),
+                )
+                if value is not None
+            ),
+            ("api_base", "http://localhost:4000"),
+        )
+        if not endpoint.startswith(("http://", "https://")):
             raise ValueError(
-                f"proxy_base_url must start with http:// or https://, "
-                f"got: {proxy_base_url}"
+                f"{name} must start with http:// or https://, got: {endpoint}"
             )
 
         # Validate timeout and max_retries
@@ -118,8 +150,12 @@ class LiteLLMOCRLoader(BaseLoader):
         if max_retries < 0:
             raise ValueError(f"max_retries must be non-negative, got: {max_retries}")
 
-        self.proxy_base_url = proxy_base_url.rstrip("/")
-        self.api_key = api_key
+        self.api_base = endpoint.rstrip("/")
+        # Keyed on presence, not truthiness: an explicit "" is a decision to send
+        # no Authorization header, so the environment must not override it.
+        if api_key is None:
+            api_key = os.environ.get("LITELLM_OCR_API_KEY")
+        self.api_key = api_key or None
         self.model = model
         self.file_path = file_path
         self.url_path = url_path
@@ -129,7 +165,16 @@ class LiteLLMOCRLoader(BaseLoader):
         self.timeout = timeout
         self.max_retries = max_retries
 
-    def _prepare_document_payload(self) -> Dict[str, Any]:
+    @property
+    def proxy_base_url(self) -> str:
+        """Deprecated name for ``api_base``, kept so existing code still reads it."""
+        return self.api_base
+
+    @proxy_base_url.setter
+    def proxy_base_url(self, value: str) -> None:
+        self.api_base = value
+
+    def _prepare_document_payload(self) -> dict[str, Any]:
         """Prepare the document payload for the OCR request.
 
         Returns:
@@ -182,10 +227,10 @@ class LiteLLMOCRLoader(BaseLoader):
             raise ValueError("No input source provided")
 
     def _make_ocr_request(
-        self, document_payload: Dict[str, Any], sync: bool = True
+        self, document_payload: dict[str, Any], sync: bool = True
     ) -> Any:
         """Make synchronous or asynchronous OCR request with retries."""
-        url = f"{self.proxy_base_url}/ocr"
+        url = f"{self.api_base}/ocr"
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -249,7 +294,7 @@ class LiteLLMOCRLoader(BaseLoader):
 
         else:
 
-            async def _async_request() -> Dict[str, Any]:
+            async def _async_request() -> dict[str, Any]:
                 last_error = None
                 attempt = 0
                 async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -303,7 +348,7 @@ class LiteLLMOCRLoader(BaseLoader):
 
             return _async_request()
 
-    def _process_response(self, response: Dict[str, Any]) -> List[Document]:
+    def _process_response(self, response: dict[str, Any]) -> list[Document]:
         """Process OCR response and return LangChain Documents.
 
         Args:
@@ -326,13 +371,13 @@ class LiteLLMOCRLoader(BaseLoader):
             for page in pages:
                 page_content = page.get("markdown", "")
 
-                metadata: Dict[str, Any] = {
+                metadata: dict[str, Any] = {
                     "page": page.get("index", 0),
                 }
 
-                # Add dimensions if available
-                if "dimensions" in page:
-                    dimensions = page["dimensions"]
+                # Add dimensions if available; the proxy sends null when unknown
+                dimensions = page.get("dimensions")
+                if dimensions is not None:
                     metadata["width"] = dimensions.get("width")
                     metadata["height"] = dimensions.get("height")
 
@@ -354,7 +399,7 @@ class LiteLLMOCRLoader(BaseLoader):
             # Concatenate all pages
             all_content = "\n\n".join(page.get("markdown", "") for page in pages)
 
-            single_metadata: Dict[str, Any] = {
+            single_metadata: dict[str, Any] = {
                 "total_pages": len(pages),
             }
 
@@ -370,7 +415,7 @@ class LiteLLMOCRLoader(BaseLoader):
 
             return [Document(page_content=all_content, metadata=single_metadata)]
 
-    def load(self) -> List[Document]:
+    def load(self) -> list[Document]:
         """Load documents synchronously.
 
         Returns:
@@ -380,7 +425,7 @@ class LiteLLMOCRLoader(BaseLoader):
         response = self._make_ocr_request(document_payload, sync=True)
         return self._process_response(response)
 
-    async def aload(self) -> List[Document]:
+    async def aload(self) -> list[Document]:
         """Load documents asynchronously.
 
         Returns:
@@ -397,6 +442,4 @@ class LiteLLMOCRLoader(BaseLoader):
         Yields:
             Document objects.
         """
-        documents = self.load()
-        for doc in documents:
-            yield doc
+        yield from self.load()

@@ -1,10 +1,188 @@
 """Test router chat model integration."""
 
-from langchain_core.messages import AIMessage
+import asyncio
+import json
+import logging
+from collections.abc import Callable
+from typing import Any
+from unittest.mock import patch
+
+import httpx
+import litellm
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage
+from litellm.types.utils import CredentialItem
 
 from langchain_litellm._version import __version__
 from langchain_litellm.chat_models import ChatLiteLLMRouter
-from tests.utils import make_router
+from langchain_litellm.chat_models.litellm_router import _deployment_metadata
+from tests.utils import (
+    OPUS_4_7_THINKS_ADAPTIVELY,
+    chat_completion_events,
+    chat_completion_reply,
+    function_call_item,
+    gemini_reply,
+    make_router,
+    message_item,
+    responses_api_events,
+    responses_api_reply,
+    serve_http,
+    serve_requests,
+    stream_reply,
+    web_search_call_item,
+    whole_reply,
+)
+
+
+def _completion_double(seen: list[dict[str, Any]]) -> Callable[..., Any]:
+    """Record the outbound kwargs and answer in the shape `stream` asked for.
+
+    A double that returns one canned value either way hands a streaming request a
+    mapping, so a wrong `stream` flag reads as success instead of the crash it is.
+    """
+
+    def _completion(**kwargs: Any) -> Any:
+        seen.append(kwargs)
+        if kwargs.get("stream"):
+            return iter(
+                [
+                    {
+                        "choices": [{"delta": {"role": "assistant", "content": "ok"}}],
+                        "usage": None,
+                    }
+                ]
+            )
+        return {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    return _completion
+
+
+def _acompletion_double(seen: list[dict[str, Any]]) -> Callable[..., Any]:
+    """Async twin of `_completion_double`."""
+
+    async def _acompletion(**kwargs: Any) -> Any:
+        sync = _completion_double(seen)(**kwargs)
+
+        if not kwargs.get("stream"):
+            return sync
+
+        async def _aiter() -> Any:
+            for chunk in sync:
+                yield chunk
+
+        return _aiter()
+
+    return _acompletion
+
+
+def _rate_limit_error() -> litellm.RateLimitError:
+    return litellm.RateLimitError(
+        message="rate limited", llm_provider="openai", model="gpt-4"
+    )
+
+
+_ROUTER_OK = {
+    "choices": [
+        {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+    ],
+}
+
+
+def _router_usage() -> dict:
+    from litellm.utils import Usage
+
+    return {
+        **_ROUTER_OK,
+        "usage": Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    }
+
+
+def test_router_forwards_explicitly_configured_connector_params() -> None:
+    """A connector-level endpoint is the caller's choice and must reach litellm.
+
+    #200/#203 added the `base_url` alias for exactly this, so dropping it would make
+    a router built with `base_url=...` silently ignore it. Only an INFERRED
+    credential is withheld, which `_resolve_api_key` handles.
+    """
+    llm = ChatLiteLLMRouter(
+        router=make_router(),
+        base_url="https://proxy.internal/v1",  # type: ignore[call-arg]
+        organization="org-ACME",
+        extra_headers={"X-Team": "platform"},
+    )
+
+    with patch.object(
+        llm.router, "completion", return_value=_router_usage()
+    ) as mock_completion:
+        llm.invoke("hi")
+
+    kwargs = mock_completion.call_args.kwargs
+    assert kwargs["api_base"] == "https://proxy.internal/v1"
+    assert kwargs["organization"] == "org-ACME"
+    assert kwargs["extra_headers"] == {"X-Team": "platform"}
+
+
+def test_router_forwards_a_per_call_api_base() -> None:
+    """A caller who wants one destination for this call still gets it."""
+    llm = ChatLiteLLMRouter(router=make_router(), api_base="https://connector/v1")
+
+    with patch.object(
+        llm.router, "completion", return_value=_router_usage()
+    ) as mock_completion:
+        llm.invoke("hi", api_base="https://for-this-call/v1")
+
+    assert mock_completion.call_args.kwargs["api_base"] == "https://for-this-call/v1"
+
+
+def test_router_does_not_forward_an_ambient_provider_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A router deployment's own credential must not be overridden.
+
+    litellm treats a passed `api_key` as a clientside credential that wins over the
+    one configured on the deployment, so a key the caller never supplied must not
+    travel with the call.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-ambient-openai")
+    llm = ChatLiteLLMRouter(router=make_router())
+
+    from litellm.utils import Usage
+
+    mock_response = {
+        "choices": [
+            {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+        ],
+        "usage": Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    }
+    with patch.object(
+        llm.router, "completion", return_value=mock_response
+    ) as mock_completion:
+        llm.invoke("hi")
+
+    assert mock_completion.call_args.kwargs.get("api_key") is None
+
+
+def test_router_keeps_a_model_kwargs_api_key_across_a_redirect() -> None:
+    """A key in `model_kwargs` is explicit caller config, so a redirect keeps it.
+
+    Withholding a key is only ever right for one inferred from the destination.
+    """
+    llm = ChatLiteLLMRouter(router=make_router(), model_kwargs={"api_key": "sk-caller"})
+
+    with patch.object(
+        llm.router, "completion", return_value=_router_usage()
+    ) as mock_completion:
+        llm.invoke("hi", model="gpt-3.5-turbo")
+
+    assert mock_completion.call_args.kwargs["api_key"] == "sk-caller"
 
 
 def test_router_provider_specific_fields_in_chat_result() -> None:
@@ -61,16 +239,896 @@ def test_router_create_chat_result_sets_usage_metadata() -> None:
     assert msg.usage_metadata["total_tokens"] == 20
 
 
-def test_router_stream_options_set_for_all_providers() -> None:
-    """Router _stream must set stream_options for non-OpenAI providers."""
-    router = make_router()
-    llm = ChatLiteLLMRouter(router=router)
-    stream_options = (
-        llm.stream_options
-        if llm.stream_options is not None
-        else {"include_usage": True}
+def _router_serving(model: str) -> litellm.Router:
+    return litellm.Router(
+        model_list=[
+            {
+                "model_name": "gpt-4o-mini",
+                "litellm_params": {"model": model, "api_key": "k"},
+            }
+        ]
     )
-    assert stream_options == {"include_usage": True}
+
+
+@pytest.mark.parametrize("method", ["invoke", "ainvoke"])
+@pytest.mark.asyncio
+async def test_router_split_reply_keeps_its_tool_calls(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """The Router builds its own result, so it must rejoin a split reply too."""
+    serve_http(
+        monkeypatch,
+        responses_api_reply(
+            message_item("Let me check."),
+            function_call_item("call_1", '{"city": "Paris"}'),
+        ),
+    )
+    llm = ChatLiteLLMRouter(router=_router_serving("openai/responses/gpt-4o-mini"))
+
+    if method == "invoke":
+        message = llm.invoke("weather?")
+    else:
+        message = await llm.ainvoke("weather?")
+
+    assert message.content == "Let me check."
+    assert [
+        (call["name"], call["args"], call["id"]) for call in message.tool_calls
+    ] == [("get_weather", {"city": "Paris"}, "call_1")]
+    assert message.response_metadata["id"] == "resp_1"
+
+
+@pytest.mark.parametrize("method", ["invoke", "ainvoke"])
+@pytest.mark.asyncio
+async def test_router_use_previous_response_id_trims_history(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """Router requests keep only the turns after the latest Responses API reply."""
+    requests = serve_http(monkeypatch, responses_api_reply(message_item("Fine.")))
+    llm = ChatLiteLLMRouter(
+        router=_router_serving("openai/responses/gpt-4o-mini"),
+        use_previous_response_id=True,
+    )
+    history = [
+        HumanMessage("Hello"),
+        AIMessage("Hi.", response_metadata={"id": "resp_previous"}),
+        HumanMessage("How are you?"),
+    ]
+
+    if method == "invoke":
+        message = llm.invoke(history)
+    else:
+        message = await llm.ainvoke(history)
+
+    payload = json.loads(requests[0].content)
+    assert payload["previous_response_id"] == "resp_previous"
+    assert payload["input"] == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "How are you?"}],
+        }
+    ]
+    assert message.response_metadata["id"] == "resp_1"
+
+
+@pytest.mark.parametrize("method", ["stream", "astream"])
+@pytest.mark.asyncio
+async def test_router_use_previous_response_id_streams_and_chains(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """A Router stream chains on the stored reply and sends only the new turn."""
+    reply = responses_api_reply(message_item("Fine."))
+    requests = serve_http(
+        monkeypatch,
+        reply,
+        responses_api_events(
+            {
+                "type": "response.created",
+                "response": {**reply, "status": "in_progress", "output": []},
+            },
+            {
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "item_id": reply["output"][0]["id"],
+                "content_index": 0,
+                "delta": "Fine.",
+                "logprobs": [],
+            },
+            {"type": "response.completed", "response": reply},
+        ),
+    )
+    llm = ChatLiteLLMRouter(
+        router=_router_serving("openai/responses/gpt-4o-mini"),
+        use_previous_response_id=True,
+    )
+    history = [
+        HumanMessage("Hello"),
+        AIMessage("Hi.", response_metadata={"id": "resp_previous"}),
+        HumanMessage("How are you?"),
+    ]
+
+    if method == "stream":
+        message = _merge(list(llm.stream(history)))
+    else:
+        message = _merge([chunk async for chunk in llm.astream(history)])
+
+    assert json.loads(requests[0].content)["previous_response_id"] == "resp_previous"
+    assert message.response_metadata["id"] == "resp_1"
+
+
+def _store_test_router(*deployments: dict[str, Any], **options: Any) -> litellm.Router:
+    return litellm.Router(
+        model_list=[
+            {
+                "model_name": "g",
+                "litellm_params": {"api_key": "k", **deployment},
+            }
+            for deployment in deployments
+        ],
+        **options,
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "cache_responses",
+        "global_cache",
+        "gpt_5_pro",
+        "identical_deployments",
+        "different_models",
+        "different_reasoning_effort",
+    ],
+)
+def test_router_chains_deployments_sharing_a_response_store(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Store checks allow groups that share a provider account and endpoint."""
+    requests = serve_http(monkeypatch, responses_api_reply(message_item("ok")))
+    endpoint = "https://same.example/v1"
+    if case == "cache_responses":
+        monkeypatch.setattr(litellm, "cache", None)
+        router = _store_test_router(
+            {"model": "openai/responses/gpt-4o-mini", "api_base": endpoint},
+            cache_responses=True,
+        )
+    elif case == "global_cache":
+        monkeypatch.setattr(litellm, "cache", litellm.Cache())
+        router = _store_test_router(
+            {"model": "openai/responses/gpt-4o-mini", "api_base": endpoint}
+        )
+    elif case == "gpt_5_pro":
+        router = _store_test_router({"model": "openai/gpt-5-pro", "api_base": endpoint})
+    elif case == "identical_deployments":
+        router = _store_test_router(
+            *(
+                {
+                    "model": "openai/responses/gpt-4o-mini",
+                    "api_base": endpoint,
+                    "rpm": 10,
+                }
+                for _ in range(2)
+            )
+        )
+    elif case == "different_models":
+        router = _store_test_router(
+            {"model": "openai/responses/gpt-4o-mini", "api_base": endpoint},
+            {"model": "openai/responses/gpt-4.1", "api_base": endpoint},
+        )
+    else:
+        router = _store_test_router(
+            {"model": "openai/responses/gpt-5-pro", "api_base": endpoint},
+            {
+                "model": "openai/responses/gpt-5-pro",
+                "api_base": endpoint,
+                "reasoning_effort": "low",
+            },
+        )
+    llm = ChatLiteLLMRouter(
+        router=router, model_name="g", use_previous_response_id=True
+    )
+    history = [
+        HumanMessage("Earlier"),
+        AIMessage("A", response_metadata={"id": "resp_previous"}),
+        HumanMessage("Next"),
+    ]
+
+    llm.invoke(history)
+
+    payload = json.loads(requests[0].content)
+    assert payload["previous_response_id"] == "resp_previous"
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_difference"),
+    [
+        ("different_api_key", "different credentials"),
+        ("different_api_base", "different API base URLs"),
+        (
+            "openai_and_azure",
+            "different providers, different API base URLs, different credentials",
+        ),
+        ("two_azure_resources", "different API base URLs"),
+    ],
+)
+def test_router_refuses_deployments_with_different_response_stores(
+    monkeypatch: pytest.MonkeyPatch, kind: str, expected_difference: str
+) -> None:
+    """A group spanning response stores refuses before sending the request."""
+    requests = serve_http(monkeypatch, responses_api_reply(message_item("ok")))
+    first = {
+        "model": "openai/responses/gpt-4o-mini",
+        "api_base": "https://one.example/v1",
+    }
+    second = dict(first)
+    if kind == "different_api_key":
+        second["api_key"] = "other-secret"
+    elif kind == "different_api_base":
+        second["api_base"] = "https://two.example/v1"
+    elif kind == "openai_and_azure":
+        second = {
+            "model": "azure/responses/my-deployment",
+            "api_base": "https://one.openai.azure.com",
+            "api_version": "2025-04-01-preview",
+        }
+    else:
+        first = {
+            "model": "azure/responses/my-deployment",
+            "api_base": "https://one.openai.azure.com",
+            "api_version": "2025-04-01-preview",
+        }
+        second = {
+            "model": "azure/responses/my-deployment",
+            "api_base": "https://two.openai.azure.com",
+            "api_version": "2025-04-01-preview",
+        }
+    llm = ChatLiteLLMRouter(
+        router=_store_test_router(first, second),
+        model_name="g",
+        use_previous_response_id=True,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        llm.invoke(
+            [
+                HumanMessage("Earlier"),
+                AIMessage("A", response_metadata={"id": "resp_previous"}),
+                HumanMessage("Next"),
+            ]
+        )
+
+    assert str(exc_info.value) == (
+        "use_previous_response_id=True cannot safely chain model group 'g' because "
+        f"deployments use {expected_difference}. Configure the deployments with "
+        "one shared provider, API base, and credentials, or disable "
+        "use_previous_response_id."
+    )
+    assert requests == []
+
+
+def _named_credential_router(
+    monkeypatch: pytest.MonkeyPatch, *names: str
+) -> ChatLiteLLMRouter:
+    """A chaining Router whose deployments take key and base from named credentials."""
+    monkeypatch.setattr(
+        litellm,
+        "credential_list",
+        [
+            CredentialItem(
+                credential_name=name,
+                credential_values={
+                    "api_key": f"key-{name}",
+                    "api_base": f"https://{name}.example/v1",
+                },
+                credential_info={},
+            )
+            for name in ("acct-a", "acct-b")
+        ],
+    )
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "g",
+                "litellm_params": {
+                    "model": "openai/responses/gpt-4o-mini",
+                    "litellm_credential_name": name,
+                },
+            }
+            for name in names
+        ]
+    )
+    return ChatLiteLLMRouter(
+        router=router, model_name="g", use_previous_response_id=True
+    )
+
+
+def test_router_refuses_named_credentials_with_different_stores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """litellm fills a deployment's key and base from its named credential first."""
+    requests = serve_http(monkeypatch, responses_api_reply(message_item("ok")))
+    llm = _named_credential_router(monkeypatch, "acct-a", "acct-b")
+
+    with pytest.raises(ValueError) as exc_info:
+        llm.invoke(
+            [
+                HumanMessage("Earlier"),
+                AIMessage("A", response_metadata={"id": "resp_previous"}),
+                HumanMessage("Next"),
+            ]
+        )
+
+    assert str(exc_info.value) == (
+        "use_previous_response_id=True cannot safely chain model group 'g' because "
+        "deployments use different API base URLs, different credentials. Configure "
+        "the deployments with one shared provider, API base, and credentials, or "
+        "disable use_previous_response_id."
+    )
+    assert requests == []
+
+
+def test_router_chains_deployments_sharing_a_named_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two deployments on one named credential share its response store."""
+    requests = serve_http(monkeypatch, responses_api_reply(message_item("ok")))
+    llm = _named_credential_router(monkeypatch, "acct-a", "acct-a")
+
+    llm.invoke(
+        [
+            HumanMessage("Earlier"),
+            AIMessage("A", response_metadata={"id": "resp_previous"}),
+            HumanMessage("Next"),
+        ]
+    )
+
+    assert requests[0].url.host == "acct-a.example"
+    assert json.loads(requests[0].content)["previous_response_id"] == "resp_previous"
+
+
+def test_router_chaining_names_each_deployment_outside_a_responses_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fix follows the deployment list, which already names any rename."""
+    requests = serve_http(monkeypatch, responses_api_reply(message_item("ok")))
+    llm = ChatLiteLLMRouter(
+        router=_store_test_router({"model": "openai/gpt-4o-mini"}),
+        model_name="g",
+        use_previous_response_id=True,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        llm.invoke("Hi")
+
+    assert str(exc_info.value) == (
+        "use_previous_response_id=True, but litellm would not send every deployment "
+        "of model group 'g' to a Responses API:\n"
+        "- 'openai/gpt-4o-mini': litellm sends it to Chat Completions; name it "
+        "'openai/responses/gpt-4o-mini'\n"
+        "Chain only deployments litellm sends to a Responses API, or drop "
+        "use_previous_response_id to send the full history."
+    )
+    assert requests == []
+
+
+def test_router_chaining_refuses_fallbacks_with_a_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fallback can answer from another store, so removing it is the fix."""
+    requests = serve_http(monkeypatch, responses_api_reply(message_item("ok")))
+    llm = ChatLiteLLMRouter(
+        router=_store_test_router(
+            {"model": "openai/responses/gpt-4o-mini"}, fallbacks=[{"g": ["h"]}]
+        ),
+        model_name="g",
+        use_previous_response_id=True,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        llm.invoke("Hi")
+
+    assert str(exc_info.value) == (
+        "use_previous_response_id=True, but the Router sets fallbacks, so a call to "
+        "model group 'g' may reach deployments ChatLiteLLMRouter cannot check. "
+        "Chained calls must reach one response store, so remove that routing or "
+        "disable use_previous_response_id."
+    )
+    assert requests == []
+
+
+@pytest.mark.parametrize("source", ["deployment", "router_defaults"])
+def test_router_rejects_store_false(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    """A Router or deployment that disables storage cannot serve a chained id."""
+    requests = serve_http(monkeypatch, responses_api_reply(message_item("ok")))
+    deployment: dict[str, Any] = {"model": "openai/responses/gpt-4o-mini"}
+    options: dict[str, Any] = {"default_litellm_params": {"store": False}}
+    if source == "deployment":
+        deployment["store"] = False
+        options = {}
+    llm = ChatLiteLLMRouter(
+        router=_store_test_router(deployment, **options),
+        model_name="g",
+        use_previous_response_id=True,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        llm.invoke("first turn")
+
+    assert str(exc_info.value) == (
+        "use_previous_response_id=True requires stored Responses API replies, but "
+        "store=False is configured in store or extra_body for model group 'g'. "
+        "Remove store=False or disable use_previous_response_id."
+    )
+    assert requests == []
+
+
+@pytest.mark.parametrize("source", ["global", "environment"])
+def test_router_refuses_litellm_proxy_for_chaining(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    """The proxy can route to a response store the Router cannot identify."""
+    requests = serve_http(monkeypatch, responses_api_reply(message_item("ok")))
+    if source == "global":
+        monkeypatch.setattr(litellm, "use_litellm_proxy", True)
+    else:
+        monkeypatch.setenv("USE_LITELLM_PROXY", "True")
+    llm = ChatLiteLLMRouter(
+        router=_store_test_router({"model": "openai/responses/gpt-4o-mini"}),
+        model_name="g",
+        use_previous_response_id=True,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        llm.invoke("first turn")
+
+    assert str(exc_info.value) == (
+        "use_previous_response_id=True cannot safely chain model group 'g' because "
+        "litellm.use_litellm_proxy or USE_LITELLM_PROXY is enabled and the proxy "
+        "may select a different response store. Disable proxy routing or disable "
+        "use_previous_response_id."
+    )
+    assert requests == []
+
+
+def get_weather(city: str) -> str:
+    """Report the weather in a city."""
+    return city
+
+
+def _streamed_search_and_answer(reply: dict[str, Any]) -> list[dict[str, Any]]:
+    """The events the Responses API streams for ``reply``: a web search, then text."""
+    search, answer = reply["output"]
+    return responses_api_events(
+        {
+            "type": "response.created",
+            "response": {**reply, "status": "in_progress", "output": []},
+        },
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {**search, "status": "in_progress"},
+        },
+        *(
+            {
+                "type": f"response.web_search_call.{state}",
+                "output_index": 0,
+                "item_id": search["id"],
+            }
+            for state in ("in_progress", "searching", "completed")
+        ),
+        {"type": "response.output_item.done", "output_index": 0, "item": search},
+        {
+            "type": "response.output_text.delta",
+            "output_index": 1,
+            "item_id": answer["id"],
+            "content_index": 0,
+            "delta": answer["content"][0]["text"],
+            "logprobs": [],
+        },
+        {"type": "response.completed", "response": reply},
+    )
+
+
+@pytest.mark.parametrize("method", ["invoke", "ainvoke", "stream", "astream"])
+@pytest.mark.asyncio
+async def test_router_sends_built_in_tools_through_a_responses_deployment(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """Chat Completions rejects built-in tools, so the deployment's name routes them.
+
+    The search runs on the provider's side, so it never comes back as a tool call.
+    """
+    reply = responses_api_reply(web_search_call_item(), message_item("Sunny."))
+    requests = serve_http(monkeypatch, reply, _streamed_search_and_answer(reply))
+    llm = ChatLiteLLMRouter(
+        router=_router_serving("openai/responses/gpt-4o-mini")
+    ).bind_tools([get_weather, {"type": "web_search"}], tool_choice="auto")
+
+    if method == "invoke":
+        message = llm.invoke("weather in Paris?")
+    elif method == "ainvoke":
+        message = await llm.ainvoke("weather in Paris?")
+    elif method == "stream":
+        message = _merge(list(llm.stream("weather in Paris?")))
+    else:
+        message = _merge([chunk async for chunk in llm.astream("weather in Paris?")])
+
+    assert [str(request.url) for request in requests] == [
+        "https://api.openai.com/v1/responses"
+    ]
+    tools = json.loads(requests[0].content)["tools"]
+    assert [tool["type"] for tool in tools] == ["function", "web_search"]
+    assert message.content == "Sunny."
+    assert message.tool_calls == []
+    assert message.response_metadata["id"] == "resp_1"
+
+
+def test_router_n_above_one_keeps_each_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serve_http(monkeypatch, chat_completion_reply("A", "B"))
+    llm = ChatLiteLLMRouter(router=_router_serving("openai/gpt-4o-mini"))
+
+    result = llm.generate([[HumanMessage("hi")]], n=2)
+
+    assert [generation.text for generation in result.generations[0]] == ["A", "B"]
+
+
+def test_router_stream_options_default_to_include_usage() -> None:
+    """Providers other than OpenAI only report usage when it is asked for."""
+    seen: list[dict[str, Any]] = []
+    llm = ChatLiteLLMRouter(router=make_router())
+
+    with patch.object(llm.router, "completion", side_effect=_completion_double(seen)):
+        list(llm.stream("hi"))
+
+    assert seen[0]["stream_options"] == {"include_usage": True}
+
+
+def test_router_stream_honours_a_per_call_stream_options() -> None:
+    """`stream_options` is caller configuration, so a per-call value is not replaced."""
+    seen: list[dict[str, Any]] = []
+    llm = ChatLiteLLMRouter(router=make_router())
+
+    with patch.object(llm.router, "completion", side_effect=_completion_double(seen)):
+        list(llm.stream("hi", stream_options={"include_usage": False}))
+
+    assert seen[0]["stream_options"] == {"include_usage": False}
+
+
+@pytest.mark.asyncio
+async def test_router_astream_honours_a_per_call_stream_options() -> None:
+    """The async path carries the same caller configuration as the sync one."""
+    seen: list[dict[str, Any]] = []
+    llm = ChatLiteLLMRouter(router=make_router())
+
+    with patch.object(llm.router, "acompletion", side_effect=_acompletion_double(seen)):
+        async for _ in llm.astream("hi", stream_options={"include_usage": False}):
+            pass
+
+    assert seen[0]["stream_options"] == {"include_usage": False}
+
+
+@pytest.mark.parametrize("method", ["stream", "astream"])
+@pytest.mark.asyncio
+async def test_router_stream_keeps_stream_options_from_model_kwargs(
+    method: str,
+) -> None:
+    """`model_kwargs` is caller configuration too, so the default must not replace it."""
+    seen: list[dict[str, Any]] = []
+    llm = ChatLiteLLMRouter(
+        router=make_router(),
+        model_kwargs={"stream_options": {"include_usage": False}},
+    )
+
+    if method == "stream":
+        with patch.object(
+            llm.router, "completion", side_effect=_completion_double(seen)
+        ):
+            list(llm.stream("hi"))
+    else:
+        with patch.object(
+            llm.router, "acompletion", side_effect=_acompletion_double(seen)
+        ):
+            async for _ in llm.astream("hi"):
+                pass
+
+    assert seen[0]["stream_options"] == {"include_usage": False}
+
+
+@pytest.mark.parametrize("method", ["stream", "astream"])
+@pytest.mark.asyncio
+async def test_router_per_call_stream_options_none_matches_the_base_class(
+    method: str,
+) -> None:
+    """The two classes must not disagree about what an explicit None means."""
+    seen: list[dict[str, Any]] = []
+    llm = ChatLiteLLMRouter(router=make_router())
+
+    if method == "stream":
+        with patch.object(
+            llm.router, "completion", side_effect=_completion_double(seen)
+        ):
+            list(llm.stream("hi", stream_options=None))
+    else:
+        with patch.object(
+            llm.router, "acompletion", side_effect=_acompletion_double(seen)
+        ):
+            async for _ in llm.astream("hi", stream_options=None):
+                pass
+
+    assert "stream_options" in seen[0]
+    assert seen[0]["stream_options"] is None
+
+
+def test_router_is_claude_model_reads_the_matching_deployment() -> None:
+    """A model group can fan across providers, so the first entry is not the answer."""
+    import litellm
+
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "mixed",
+                "litellm_params": {"model": "azure/gpt-4", "api_key": "k"},
+            },
+            {
+                "model_name": "mixed",
+                "litellm_params": {
+                    "model": "anthropic/claude-3-5-sonnet-20241022",
+                    "api_key": "k",
+                },
+            },
+        ]
+    )
+
+    assert ChatLiteLLMRouter(router=router, model_name="mixed")._is_claude_model()
+
+
+_THINKING = {"thinking": {"type": "enabled", "budget_tokens": 1024}}
+_LOOKUP = {"type": "function", "function": {"name": "lookup", "parameters": {}}}
+
+
+def _claude_router(
+    model: str = "anthropic/claude-sonnet-4-5",
+    deployment: dict[str, Any] | None = None,
+    defaults: dict[str, Any] | None = None,
+) -> litellm.Router:
+    return litellm.Router(
+        model_list=[
+            {
+                "model_name": "claude",
+                "litellm_params": {
+                    "model": model,
+                    "api_key": "k",
+                    **(deployment or {}),
+                },
+            }
+        ],
+        default_litellm_params=defaults,
+    )
+
+
+@pytest.mark.parametrize(
+    ("router", "model_kwargs", "bind_kwargs"),
+    [
+        (lambda: _claude_router(deployment=_THINKING), {}, {}),
+        (lambda: _claude_router(defaults=dict(_THINKING)), {}, {}),
+        (_claude_router, _THINKING, {}),
+        (_claude_router, {}, _THINKING),
+        (lambda: _claude_router(deployment=_THINKING), {}, {"thinking": None}),
+        (
+            lambda: _claude_router(
+                "anthropic/claude-sonnet-4-6",
+                deployment=_THINKING,
+                defaults={"reasoning_effort": "high"},
+            ),
+            {},
+            {},
+        ),
+    ],
+    ids=[
+        "deployment",
+        "router-defaults",
+        "model-kwargs",
+        "bind-kwargs",
+        "deployment-under-a-bound-none",
+        "deployment-beside-a-default-effort",
+    ],
+)
+def test_router_downgrades_a_forced_choice_for_a_thinking_deployment(
+    router: Callable[[], litellm.Router],
+    model_kwargs: dict[str, Any],
+    bind_kwargs: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The Router picks the deployment, so thinking can be configured there alone."""
+    llm = ChatLiteLLMRouter(router=router(), model_kwargs=model_kwargs)
+
+    with caplog.at_level(
+        logging.WARNING, logger="langchain_litellm.chat_models.litellm"
+    ):
+        bound = llm.bind_tools([_LOOKUP], tool_choice="required", **bind_kwargs)
+
+    assert bound.kwargs["tool_choice"] == "auto"  # type: ignore[attr-defined]
+    assert "incompatible with thinking" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("deployment", "model_kwargs"),
+    [(_THINKING, {}), ({"reasoning_effort": "high"}, {}), ({}, _THINKING)],
+    ids=["deployment", "deployment-effort", "model-kwargs"],
+)
+def test_router_downgrades_a_forced_choice_for_a_deployment_aliased_to_claude(
+    deployment: dict[str, Any],
+    model_kwargs: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """litellm swaps a deployment's alias in when it sends the call."""
+    monkeypatch.setitem(
+        litellm.model_alias_map, "anthropic/fast", "anthropic/claude-sonnet-4-5"
+    )
+    router = _claude_router("anthropic/fast", deployment=deployment)
+    llm = ChatLiteLLMRouter(router=router, model_kwargs=model_kwargs)
+
+    with caplog.at_level(
+        logging.WARNING, logger="langchain_litellm.chat_models.litellm"
+    ):
+        bound = llm.bind_tools([_LOOKUP], tool_choice="required")
+
+    assert bound.kwargs["tool_choice"] == "auto"  # type: ignore[attr-defined]
+    assert "incompatible with thinking" in caplog.text
+
+
+def test_router_keeps_a_forced_choice_no_claude_deployment_refuses() -> None:
+    """Only a Claude deployment with manual thinking refuses the forced tool."""
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "mixed",
+                "litellm_params": {
+                    "model": "anthropic/claude-sonnet-4-6",
+                    "api_key": "k",
+                    "reasoning_effort": "high",
+                },
+            },
+            {
+                "model_name": "mixed",
+                "litellm_params": {
+                    "model": "deepseek/deepseek-chat",
+                    "api_key": "k",
+                    **_THINKING,
+                },
+            },
+        ]
+    )
+
+    bound = ChatLiteLLMRouter(router=router, model_name="mixed").bind_tools(
+        [_LOOKUP], tool_choice="required"
+    )
+
+    assert bound.kwargs["tool_choice"] == "required"  # type: ignore[attr-defined]
+
+
+@pytest.mark.skipif(
+    not OPUS_4_7_THINKS_ADAPTIVELY, reason="this litellm sends it manual thinking"
+)
+def test_router_keeps_a_forced_choice_a_deployment_sends_beside_adaptive_thinking() -> (
+    None
+):
+    """A deployment's thinking counts only as litellm sends it."""
+    router = _claude_router("anthropic/claude-opus-4-7", deployment=_THINKING)
+
+    bound = ChatLiteLLMRouter(router=router).bind_tools(
+        [_LOOKUP], tool_choice="required"
+    )
+
+    assert bound.kwargs["tool_choice"] == "required"  # type: ignore[attr-defined]
+
+
+# Newer litellm Routers drop a deployment's thinking under a request's reasoning_effort.
+_REQUEST_EFFORT_REPLACES_DEPLOYMENT_THINKING = hasattr(
+    litellm.Router, "_deployment_params_with_request_reasoning_override"
+)
+
+
+@pytest.mark.skipif(
+    not _REQUEST_EFFORT_REPLACES_DEPLOYMENT_THINKING,
+    reason="this litellm's Router sends both",
+)
+def test_router_keeps_a_forced_choice_when_a_request_effort_replaces_thinking() -> None:
+    """The deployment's manual thinking is dropped, and effort on Sonnet 4.6 is adaptive."""
+    router = _claude_router("anthropic/claude-sonnet-4-6", deployment=_THINKING)
+    llm = ChatLiteLLMRouter(router=router, model_kwargs={"reasoning_effort": "high"})
+
+    bound = llm.bind_tools([_LOOKUP], tool_choice="required")
+
+    assert bound.kwargs["tool_choice"] == "required"  # type: ignore[attr-defined]
+
+
+def test_router_structured_output_stops_forcing_for_a_thinking_deployment() -> None:
+    """Structured output reads the same deployments as bind_tools."""
+    llm = ChatLiteLLMRouter(router=_claude_router(deployment=_THINKING))
+
+    with pytest.warns(UserWarning, match="Structured output via function calling"):
+        structured = llm.with_structured_output(
+            {"title": "Answer", "type": "object", "properties": {}},
+            method="function_calling",
+        )
+
+    assert structured.first.kwargs["tool_choice"] is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "models",
+    [["anthropic/claude-opus-5-5"], ["openai/gpt-4o", "anthropic/claude-fable-5-1"]],
+    ids=["deployment", "one-deployment-of-a-group"],
+)
+def test_router_downgrades_a_forced_choice_for_a_deployment_that_refuses_it(
+    models: list[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The Router alias names no model, so every deployment it may pick is asked."""
+    router = litellm.Router(
+        model_list=[
+            {"model_name": "assistant", "litellm_params": {"model": m, "api_key": "k"}}
+            for m in models
+        ]
+    )
+    llm = ChatLiteLLMRouter(router=router, model_name="assistant")
+
+    with caplog.at_level(
+        logging.WARNING, logger="langchain_litellm.chat_models.litellm"
+    ):
+        bound = llm.bind_tools([_LOOKUP], tool_choice="required")
+
+    assert bound.kwargs["tool_choice"] == "auto"  # type: ignore[attr-defined]
+    assert "unsupported by this model" in caplog.text
+
+
+def test_router_structured_output_stops_forcing_for_a_deployment_that_refuses_it() -> (
+    None
+):
+    """Structured output reads the same deployments as bind_tools."""
+    llm = ChatLiteLLMRouter(router=_claude_router("anthropic/claude-opus-5-5"))
+
+    with pytest.warns(UserWarning, match="does not support forced tool use"):
+        structured = llm.with_structured_output(
+            {"title": "Answer", "type": "object", "properties": {}},
+            method="function_calling",
+        )
+
+    assert structured.first.kwargs["tool_choice"] is None  # type: ignore[attr-defined]
+
+
+def test_router_generate_does_not_inherit_a_streaming_default() -> None:
+    """This branch parses a mapping, so a caller's `stream=False` must reach litellm.
+
+    A `streaming=True` instance otherwise sends `stream=True` and is handed an
+    iterator where it expects a mapping.
+    """
+    seen: list[dict[str, Any]] = []
+    llm = ChatLiteLLMRouter(router=make_router(), streaming=True)
+
+    with patch.object(llm.router, "completion", side_effect=_completion_double(seen)):
+        message = llm.invoke("hi", stream=False)
+
+    assert seen[0]["stream"] is False
+    assert message.content == "ok"
+
+
+@pytest.mark.asyncio
+async def test_router_agenerate_does_not_inherit_a_streaming_default() -> None:
+    """The async twin of the same branch."""
+    seen: list[dict[str, Any]] = []
+    llm = ChatLiteLLMRouter(router=make_router(), streaming=True)
+
+    with patch.object(llm.router, "acompletion", side_effect=_acompletion_double(seen)):
+        message = await llm.ainvoke("hi", stream=False)
+
+    assert seen[0]["stream"] is False
+    assert message.content == "ok"
 
 
 def test_router_metadata_versions() -> None:
@@ -120,3 +1178,684 @@ def test_router_stream_sets_model_provider_in_response_metadata() -> None:
 
     assert chunks[0].message.response_metadata.get("model_provider") == "litellm"
     assert chunks[1].message.response_metadata == {}
+
+
+def test_router_stream_root_provider_specific_fields_in_response_metadata() -> None:
+    """Response-level fields go to response_metadata, where invoke puts them."""
+    llm = ChatLiteLLMRouter(router=make_router())
+    citations = {"citations": [{"source": "vertex"}]}
+    fake_chunks = [
+        {
+            "choices": [{"delta": {"role": "assistant", "content": "hi"}}],
+            "usage": None,
+            "provider_specific_fields": citations,
+        },
+    ]
+    with patch.object(llm.router, "completion", return_value=iter(fake_chunks)):
+        chunks = list(llm._stream([]))
+
+    first = chunks[0].message
+    assert first.response_metadata["provider_specific_fields"] == citations
+    assert "provider_specific_fields" not in first.additional_kwargs
+
+
+_GROUNDING = {
+    "webSearchQueries": ["tallest mountain"],
+    "groundingChunks": [{"web": {"uri": "https://example.com", "title": "example"}}],
+}
+
+
+@pytest.mark.parametrize("method", ["invoke", "ainvoke", "stream", "astream"])
+async def test_router_grounding_reaches_response_metadata_streamed_or_not(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """Router chunks stay litellm objects, so the fields are read by attribute."""
+    reply = gemini_reply("Everest.", _GROUNDING)
+    serve_http(monkeypatch, reply, [reply])
+    llm = ChatLiteLLMRouter(router=_router_serving("gemini/gemini-2.5-flash"))
+
+    message = await whole_reply(llm, method)
+
+    assert message.response_metadata["provider_specific_fields"] == [_GROUNDING]
+    assert "provider_specific_fields" not in message.additional_kwargs
+
+
+def _router_chunks_with_cost() -> list[dict[str, Any]]:
+    """The shape the router streams back: every chunk names the deployment."""
+    deployment = {"model_id": "deployment-A"}
+    return [
+        {
+            "choices": [{"delta": {"role": "assistant", "content": "hel"}}],
+            "usage": None,
+            "_hidden_params": deployment,
+        },
+        {
+            "choices": [{"delta": {"content": "lo"}, "finish_reason": "stop"}],
+            "usage": None,
+            "_hidden_params": deployment,
+        },
+        {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 2,
+                "total_tokens": 7,
+                "cost": 2.4e-06,
+            },
+            "_hidden_params": deployment,
+        },
+    ]
+
+
+def _merge(chunks: list[Any]) -> Any:
+    """Merge a stream the way a caller consuming it does."""
+    merged = chunks[0]
+    for chunk in chunks[1:]:
+        merged = merged + chunk
+    return merged
+
+
+def test_router_streamed_cost_reaches_response_metadata() -> None:
+    """The router reports a streamed cost on a trailing chunk with no content.
+
+    That chunk arrives with an empty `choices`, so a cost read only off content
+    chunks never surfaces at all.
+    """
+    llm = ChatLiteLLMRouter(router=make_router())
+
+    with patch.object(
+        llm.router, "completion", return_value=iter(_router_chunks_with_cost())
+    ):
+        chunks = [chunk.message for chunk in llm._stream([])]
+
+    assert _merge(chunks).response_metadata["response_cost"] == 2.4e-06
+
+
+@pytest.mark.asyncio
+async def test_router_astreamed_cost_reaches_response_metadata() -> None:
+    """The async path must surface the cost the sync path surfaces."""
+    llm = ChatLiteLLMRouter(router=make_router())
+
+    async def _acompletion(**kwargs: Any) -> Any:
+        async def _aiter() -> Any:
+            for chunk in _router_chunks_with_cost():
+                yield chunk
+
+        return _aiter()
+
+    with patch.object(llm.router, "acompletion", side_effect=_acompletion):
+        chunks = [chunk.message async for chunk in llm._astream([])]
+
+    merged = _merge(chunks)
+    assert merged.response_metadata["response_cost"] == 2.4e-06
+    # The sync loop has its own guard; this loop is a copy and needs its own.
+    assert merged.response_metadata["model_id"] == "deployment-A"
+
+
+def test_router_names_the_deployment_once_across_a_stream() -> None:
+    """The deployment holds for the whole response, and langchain joins strings.
+
+    Named on every chunk, the merged message reads `deployment-Adeployment-A`.
+    """
+    llm = ChatLiteLLMRouter(router=make_router())
+
+    with patch.object(
+        llm.router, "completion", return_value=iter(_router_chunks_with_cost())
+    ):
+        chunks = [chunk.message for chunk in llm._stream([])]
+
+    assert _merge(chunks).response_metadata["model_id"] == "deployment-A"
+
+
+def _router_chunks_costing_twice() -> list[dict[str, Any]]:
+    """A deployment that attaches usage, and so a cost, to content chunks."""
+    deployment = {"model_id": "deployment-A"}
+    return [
+        {
+            "choices": [{"delta": {"role": "assistant", "content": "hel"}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "cost": 1.0e-06},
+            "_hidden_params": deployment,
+        },
+        {
+            "choices": [{"delta": {"content": "lo"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "cost": 2.4e-06},
+            "_hidden_params": deployment,
+        },
+    ]
+
+
+def test_router_names_a_streamed_cost_once() -> None:
+    """langchain raises on two differing floats, so the merge would not survive."""
+    llm = ChatLiteLLMRouter(router=make_router())
+
+    with patch.object(
+        llm.router, "completion", return_value=iter(_router_chunks_costing_twice())
+    ):
+        chunks = [chunk.message for chunk in llm._stream([])]
+
+    naming = [c for c in chunks if "response_cost" in c.response_metadata]
+    assert len(naming) == 1
+    assert _merge(chunks).response_metadata["response_cost"] == 1.0e-06
+
+
+@pytest.mark.asyncio
+async def test_router_names_an_astreamed_cost_once() -> None:
+    """The async loop merges the same way, so it needs the same guarantee."""
+    llm = ChatLiteLLMRouter(router=make_router())
+
+    async def _acompletion(**kwargs: Any) -> Any:
+        async def _aiter() -> Any:
+            for chunk in _router_chunks_costing_twice():
+                yield chunk
+
+        return _aiter()
+
+    with patch.object(llm.router, "acompletion", side_effect=_acompletion):
+        chunks = [chunk.message async for chunk in llm._astream([])]
+
+    naming = [c for c in chunks if "response_cost" in c.response_metadata]
+    assert len(naming) == 1
+    assert _merge(chunks).response_metadata["response_cost"] == 1.0e-06
+
+
+_USAGE = {"prompt_tokens": 12, "completion_tokens": 12, "total_tokens": 24}
+
+
+def _collect(llm: Any, mode: str) -> Any:
+    """``llm``'s reply streamed through ``mode``, merged the way a caller merges it."""
+    if mode == "stream":
+        return _merge(list(llm.stream("hi")))
+
+    async def collect() -> list[Any]:
+        return [chunk async for chunk in llm.astream("hi")]
+
+    return _merge(asyncio.run(collect()))
+
+
+@pytest.mark.parametrize("mode", ["stream", "astream"])
+def test_a_router_streamed_reply_costs_what_the_invoked_reply_costs(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Through real litellm, which puts the cost on a stream's usage chunk from 1.101.0.
+
+    Hand-built chunks carry a cost whatever litellm sends, so they cannot show it.
+    """
+    serve_http(
+        monkeypatch,
+        chat_completion_reply("Hi", usage=_USAGE),
+        chat_completion_events("Hi", _USAGE),
+    )
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "mini",
+                "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "k"},
+            }
+        ]
+    )
+    llm = ChatLiteLLMRouter(router=router, model_name="mini")
+
+    invoked = llm.invoke("hi").response_metadata["response_cost"]
+
+    assert invoked > 0
+    assert _collect(llm, mode).response_metadata["response_cost"] == invoked
+
+
+@pytest.mark.parametrize("mode", ["stream", "astream"])
+def test_a_router_stream_that_falls_back_costs_what_its_reply_costs(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """litellm prices a fallback stream at 0.0 before any token arrives.
+
+    It copies that onto every fallback chunk; the reply's cost is on its usage chunk.
+    """
+    failed: list[httpx.Request] = []
+
+    def _reply(request: httpx.Request) -> httpx.Response:
+        if not json.loads(request.content).get("stream"):
+            reply = chat_completion_reply("Hi", usage=_USAGE)
+            return httpx.Response(200, json=reply, request=request)
+        if request.url.host == "primary.example" and not failed:
+            # Failing before the first chunk hands the stream to the fallback.
+            failed.append(request)
+            error = {"message": "overloaded", "type": "server_error", "code": 500}
+            return stream_reply(request, [{"error": error}])
+        return stream_reply(request, chat_completion_events("Hi", _USAGE))
+
+    serve_requests(monkeypatch, _reply)
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": group,
+                "litellm_params": {
+                    "model": "openai/gpt-4o-mini",
+                    "api_key": "k",
+                    "api_base": f"https://{group}.example/v1",
+                },
+            }
+            for group in ("primary", "backup")
+        ],
+        fallbacks=[{"primary": ["backup"]}],
+        num_retries=0,
+    )
+    llm = ChatLiteLLMRouter(router=router, model_name="primary")
+
+    invoked = llm.invoke("hi").response_metadata["response_cost"]
+    streamed = _collect(llm, mode).response_metadata["response_cost"]
+
+    assert failed
+    assert invoked > 0
+    assert streamed == invoked
+
+
+def test_deployment_is_read_from_either_shape_litellm_hands_over() -> None:
+    """The router's loops hold the response model, and its result builder a mapping.
+
+    An unset deployment must add no key: a `model_id` of None reads downstream as a
+    deployment that was named.
+    """
+    from types import SimpleNamespace
+
+    named = {"model_id": "deployment-A"}
+    assert _deployment_metadata({"_hidden_params": named}) == named
+    assert _deployment_metadata(SimpleNamespace(_hidden_params=named)) == named
+    assert _deployment_metadata({"_hidden_params": {"model_id": None}}) == {}
+    assert _deployment_metadata({}) == {}
+
+
+def test_router_create_chat_result_names_the_cost_and_deployment() -> None:
+    """A complete response carries both in `_hidden_params`, alongside much else.
+
+    The assertion is on the exact set this block builds, so copying `_hidden_params`
+    wholesale fails here.
+    """
+    llm = ChatLiteLLMRouter(router=make_router())
+    mock_response = {
+        "choices": [
+            {"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        "_hidden_params": {
+            "response_cost": 1.35e-05,
+            "model_id": "deployment-A",
+            "api_base": "https://faketesturl/",
+            "optional_params": {"temperature": 0.1},
+        },
+    }
+
+    result = llm._create_chat_result(mock_response, metadata={})
+    metadata = result.generations[0].message.response_metadata
+
+    assert metadata == {
+        "model_name": llm.model_name or llm.model,
+        "model_provider": "litellm",
+        "response_cost": 1.35e-05,
+        "model_id": "deployment-A",
+    }
+
+
+def _completion_filling_router_metadata() -> Callable[..., Any]:
+    """Answer the way litellm does, by filling the caller's `metadata` dict in place.
+
+    The Router treats that dict as an out-parameter for its own bookkeeping, so a
+    double that ignores it cannot reproduce what a caller finally receives.
+    """
+
+    def _completion(**kwargs: Any) -> Any:
+        kwargs["metadata"].update(
+            {
+                "model_group": "gpt-3.5-turbo",
+                "deployment": "azure/fake-deployment-name-2",
+                "api_base": "https://faketesturl/",
+                "model_info": {"id": "deployment-A"},
+                "hidden_params": {
+                    "api_base": "https://faketesturl/",
+                    "optional_params": {"temperature": 0.1},
+                    "response_cost": 1.35e-05,
+                },
+            }
+        )
+        return {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "_hidden_params": {"response_cost": 1.35e-05, "model_id": "deployment-A"},
+        }
+
+    return _completion
+
+
+_DELIVERED_KEYS = {
+    "model_name",
+    "model_provider",
+    "finish_reason",
+    "token_usage",
+    "response_cost",
+    "model_id",
+}
+
+
+def test_router_delivers_only_the_keys_it_names() -> None:
+    """`llm_output` reaches the message only after `_create_chat_result` returns.
+
+    Reading the generation directly is blind to that merge, so this goes through
+    `invoke()`, which is what a caller receives.
+    """
+    llm = ChatLiteLLMRouter(router=make_router())
+
+    with patch.object(
+        llm.router, "completion", side_effect=_completion_filling_router_metadata()
+    ):
+        metadata = llm.invoke("hi").response_metadata
+
+    assert set(metadata) == _DELIVERED_KEYS
+
+
+@pytest.mark.asyncio
+async def test_router_delivers_the_same_keys_on_both_entry_points() -> None:
+    """litellm fills `hidden_params` on the sync path and not on the async one.
+
+    Copying that dict makes the delivered key set depend on which method was
+    called, so a caller reading a key cannot know whether to expect it.
+    """
+    llm = ChatLiteLLMRouter(router=make_router())
+    sync_double = _completion_filling_router_metadata()
+
+    async def _acompletion(**kwargs: Any) -> Any:
+        # litellm does not reach the logging path that writes `hidden_params` here.
+        result = sync_double(**kwargs)
+        kwargs["metadata"].pop("hidden_params", None)
+        return result
+
+    with patch.object(llm.router, "completion", side_effect=sync_double):
+        sync_metadata = llm.invoke("hi").response_metadata
+    with patch.object(llm.router, "acompletion", side_effect=_acompletion):
+        async_metadata = (await llm.ainvoke("hi")).response_metadata
+
+    assert set(sync_metadata) == set(async_metadata) == _DELIVERED_KEYS
+
+
+def test_router_base_url_alias_reaches_completion() -> None:
+    """Test that base_url flows through inheritance and survives router param stripping."""
+    from litellm import Router
+
+    from langchain_litellm import ChatLiteLLMRouter
+
+    # Setup a basic underlying litellm router
+    litellm_router = Router(
+        model_list=[
+            {
+                "model_name": "gpt-3.5-turbo",
+                "litellm_params": {"model": "gpt-3.5-turbo"},
+            }
+        ]
+    )
+
+    # Initialize the LangChain router wrapper with a base_url override
+    chat_router = ChatLiteLLMRouter(
+        router=litellm_router, base_url="https://proxy.example/v1"
+    )
+
+    # Assert 1: The inherited validator normalized base_url into api_base
+    assert chat_router.api_base == "https://proxy.example/v1"
+
+    # Assert 2: it survives all the way to the outbound call, not just to
+    # _prepare_params_for_router. Asserting on that helper alone left this green
+    # while an override upstream was discarding the value.
+    with patch.object(
+        chat_router.router, "completion", return_value=_router_usage()
+    ) as mock_completion:
+        chat_router.invoke("hi")
+
+    assert mock_completion.call_args.kwargs["api_base"] == "https://proxy.example/v1"
+
+
+def test_router_generate_honours_max_retries() -> None:
+    """ChatLiteLLMRouter._generate must retry via completion_with_retry.
+
+    Regression test: previously `_generate` called `self.router.completion`
+    directly, bypassing the tenacity retry decorator entirely, so
+    `max_retries` had no effect for `ChatLiteLLMRouter`.
+    """
+    router = make_router()
+    llm = ChatLiteLLMRouter(router=router, max_retries=4)
+
+    with (
+        patch.object(
+            llm.router, "completion", side_effect=_rate_limit_error()
+        ) as mock_completion,
+        patch("time.sleep", return_value=None),  # skip tenacity backoff
+        pytest.raises(litellm.RateLimitError),
+    ):
+        llm.invoke("hi")
+
+    assert mock_completion.call_count == 4
+
+
+def test_router_stream_honours_max_retries() -> None:
+    """ChatLiteLLMRouter._stream must retry via completion_with_retry."""
+    router = make_router()
+    llm = ChatLiteLLMRouter(router=router, max_retries=4, streaming=True)
+
+    with (
+        patch.object(
+            llm.router, "completion", side_effect=_rate_limit_error()
+        ) as mock_completion,
+        patch("time.sleep", return_value=None),
+        pytest.raises(litellm.RateLimitError),
+    ):
+        list(llm.stream("hi"))
+
+    assert mock_completion.call_count == 4
+
+
+@pytest.mark.asyncio
+async def test_router_agenerate_honours_max_retries() -> None:
+    """ChatLiteLLMRouter._agenerate must retry via acompletion_with_retry."""
+    router = make_router()
+    llm = ChatLiteLLMRouter(router=router, max_retries=4)
+
+    async def _raise(**kwargs: object) -> None:
+        raise _rate_limit_error()
+
+    with (
+        patch.object(llm.router, "acompletion", side_effect=_raise) as mock_acompletion,
+        patch("asyncio.sleep", return_value=None),  # skip tenacity backoff
+        pytest.raises(litellm.RateLimitError),
+    ):
+        await llm.ainvoke("hi")
+
+    assert mock_acompletion.call_count == 4
+
+
+@pytest.mark.asyncio
+async def test_router_astream_honours_max_retries() -> None:
+    """ChatLiteLLMRouter._astream must retry via acompletion_with_retry.
+
+    This is the only call site written as ``async for chunk in await ...``, so
+    neither the ``_agenerate`` test (which awaits a value) nor the ``_stream``
+    test (which iterates without awaiting) covers it.
+    """
+    router = make_router()
+    llm = ChatLiteLLMRouter(router=router, max_retries=4, streaming=True)
+
+    async def _raise(**kwargs: object) -> None:
+        raise _rate_limit_error()
+
+    with (
+        patch.object(llm.router, "acompletion", side_effect=_raise) as mock_acompletion,
+        patch("asyncio.sleep", return_value=None),  # skip tenacity backoff
+        pytest.raises(litellm.RateLimitError),
+    ):
+        async for _ in llm.astream("hi"):
+            pass
+
+    assert mock_acompletion.call_count == 4
+
+
+def test_router_generate_no_retry_on_success() -> None:
+    """A successful router call must not be retried unnecessarily."""
+    from litellm.utils import Usage
+
+    router = make_router()
+    llm = ChatLiteLLMRouter(router=router, max_retries=4)
+
+    mock_response = {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    }
+
+    with patch.object(
+        llm.router, "completion", return_value=mock_response
+    ) as mock_completion:
+        result = llm.invoke("hi")
+
+    assert mock_completion.call_count == 1
+    assert result.content == "hello"
+
+
+def _usage_response() -> dict:
+    from litellm.utils import Usage
+
+    return {
+        "choices": [
+            {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+        ],
+        "usage": Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    }
+
+
+def test_router_set_default_model_changes_the_model_sent() -> None:
+    """`_default_params` prefers `model_name`, so setting only `model` had no effect."""
+    llm = ChatLiteLLMRouter(router=make_router(), model_name="gpt-4")
+
+    with patch.object(
+        llm.router, "completion", return_value=_usage_response()
+    ) as first:
+        llm.invoke("hi")
+    llm.set_default_model("gpt-3.5-turbo")
+    with patch.object(
+        llm.router, "completion", return_value=_usage_response()
+    ) as second:
+        llm.invoke("hi")
+
+    assert first.call_args.kwargs["model"] == "gpt-4"
+    assert second.call_args.kwargs["model"] == "gpt-3.5-turbo"
+
+
+@pytest.mark.parametrize(
+    ("config", "call"),
+    [
+        ({"use_responses_api": True}, {}),
+        ({"model_kwargs": {"use_responses_api": True}}, {}),
+        ({}, {"use_responses_api": True}),
+    ],
+)
+def test_router_refuses_use_responses_api_for_a_chat_deployment(
+    config: dict[str, Any], call: dict[str, Any]
+) -> None:
+    """The Router picks the deployment, so only a deployment can name the route."""
+    llm = ChatLiteLLMRouter(router=make_router(), **config)
+
+    with (
+        patch.object(llm.router, "completion") as completion,
+        pytest.raises(
+            ValueError, match="name it 'azure/responses/fake-deployment-name-1'"
+        ),
+    ):
+        llm.invoke("hi", **call)
+
+    completion.assert_not_called()
+
+
+@pytest.mark.parametrize("value", [False, None])
+def test_router_calls_with_use_responses_api_left_off(value: bool | None) -> None:
+    """A config that spells the flag out as off must still reach the Router."""
+    llm = ChatLiteLLMRouter(router=make_router(), use_responses_api=value)
+
+    with patch.object(
+        llm.router, "completion", return_value=_router_usage()
+    ) as completion:
+        llm.invoke("hi")
+
+    assert completion.call_args.kwargs["model"] == "gpt-4"
+
+
+def test_router_is_claude_model_reads_the_deployment() -> None:
+    """The Router alias need not contain the provider's model name at all."""
+    import litellm
+
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "my-alias",
+                "litellm_params": {
+                    "model": "anthropic/claude-3-5-sonnet-20241022",
+                    "api_key": "sk-x",
+                },
+            }
+        ]
+    )
+    llm = ChatLiteLLMRouter(router=router)
+    assert llm._is_claude_model() is True
+
+    assert ChatLiteLLMRouter(router=make_router())._is_claude_model() is False
+
+
+def test_router_combine_llm_outputs_accepts_a_plain_dict_usage() -> None:
+    """`_create_chat_result` passes `response["usage"]` through unchanged."""
+    llm = ChatLiteLLMRouter(router=make_router())
+    combined = llm._combine_llm_outputs(
+        [{"token_usage": {"total_tokens": 3}, "model": "gpt-4"}]
+    )
+    assert combined["token_usage"]["total_tokens"] == 3
+
+
+@pytest.mark.parametrize("method", ["stream", "astream"])
+@pytest.mark.asyncio
+async def test_router_surfaces_finish_reason_in_response_metadata(method: str) -> None:
+    """The Router overrides both streaming paths, so it needs the same handling.
+
+    A caller streaming through a Router sees the same completed response the base
+    class reports, so it carries the same `finish_reason`.
+    """
+    chunks = [
+        {
+            "choices": [{"delta": {"role": "assistant", "content": "hel"}}],
+            "usage": None,
+        },
+        {
+            "choices": [{"delta": {"content": "lo"}, "finish_reason": "stop"}],
+            "usage": None,
+        },
+    ]
+    llm = ChatLiteLLMRouter(router=make_router())
+
+    async def _acompletion(**kwargs: Any) -> Any:
+        async def _aiter() -> Any:
+            for chunk in chunks:
+                yield chunk
+
+        return _aiter()
+
+    merged = None
+    if method == "stream":
+        with patch.object(llm.router, "completion", return_value=iter(chunks)):
+            for chunk in llm.stream("hi"):
+                merged = chunk if merged is None else merged + chunk
+    else:
+        with patch.object(llm.router, "acompletion", side_effect=_acompletion):
+            async for chunk in llm.astream("hi"):
+                merged = chunk if merged is None else merged + chunk
+
+    assert merged is not None
+    assert merged.response_metadata["finish_reason"] == "stop"

@@ -1,7 +1,7 @@
 """Unit tests for LiteLLMEmbeddingsRouter."""
 
-from typing import Type
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any, ClassVar
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_tests.unit_tests import EmbeddingsUnitTests
@@ -12,7 +12,7 @@ from tests.utils import make_embedding_router, mock_embedding_response
 
 class TestLiteLLMEmbeddingsRouterUnit(EmbeddingsUnitTests):
     @property
-    def embeddings_class(self) -> Type[LiteLLMEmbeddingsRouter]:
+    def embeddings_class(self) -> type[LiteLLMEmbeddingsRouter]:
         return LiteLLMEmbeddingsRouter
 
     @property
@@ -37,6 +37,35 @@ class TestLiteLLMEmbeddingsRouterParams:
         assert "timeout" not in params
         assert "dimensions" not in params
         assert "model" in params
+
+    def test_base_url_rejected(self) -> None:
+        """Test that base_url is rejected by router embeddings."""
+        router = make_embedding_router()
+
+        with pytest.raises(ValueError, match="base_url.*not supported"):
+            LiteLLMEmbeddingsRouter(
+                router=router,
+                base_url="https://proxy.example/v1",
+            )
+
+    def test_api_base_rejected(self) -> None:
+        """Test that api_base is rejected by router embeddings."""
+        router = make_embedding_router()
+
+        with pytest.raises(ValueError, match="api_base.*not supported"):
+            LiteLLMEmbeddingsRouter(
+                router=router,
+                api_base="https://proxy.example/v1",
+            )
+
+    @pytest.mark.parametrize("name", ["api_base", "base_url"])
+    def test_an_unset_endpoint_is_accepted(self, name: str) -> None:
+        """A config built from os.getenv carries None for an unset value."""
+        router = make_embedding_router()
+
+        embeddings = LiteLLMEmbeddingsRouter(router=router, **{name: None})
+
+        assert embeddings.api_base is None
 
     def test_embed_documents_uses_router(self):
         """Test that embed_documents delegates to router.embedding()."""
@@ -98,3 +127,150 @@ class TestLiteLLMEmbeddingsRouterParams:
 
         router.aembedding.assert_called_once()
         assert result == [0.1, 0.2, 0.3]
+
+
+def _one_deployment_router() -> Any:
+    import litellm
+
+    return litellm.Router(
+        model_list=[
+            {
+                "model_name": "emb-small",
+                "litellm_params": {
+                    "model": "openai/text-embedding-3-small",
+                    "api_key": "sk-deployment",
+                },
+            }
+        ]
+    )
+
+
+@pytest.mark.parametrize("method", ["embed_query", "embed_documents"])
+def test_embeddings_router_honours_max_retries(method: str) -> None:
+    """The embed methods called router.embedding directly, bypassing the decorator.
+
+    Same defect ChatLiteLLMRouter had: the inherited `max_retries` had no effect.
+    """
+    import litellm
+
+    embeddings = LiteLLMEmbeddingsRouter(router=_one_deployment_router(), max_retries=4)
+
+    def _raise(*args: Any, **kwargs: Any) -> Any:
+        raise litellm.RateLimitError(
+            message="rate limited", llm_provider="openai", model="x"
+        )
+
+    with (
+        patch.object(
+            embeddings.router, "embedding", side_effect=_raise
+        ) as mock_embedding,
+        patch("time.sleep", return_value=None),
+        pytest.raises(litellm.RateLimitError),
+    ):
+        getattr(embeddings, method)(["hi"] if "documents" in method else "hi")
+
+    assert mock_embedding.call_count == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["aembed_query", "aembed_documents"])
+async def test_embeddings_router_honours_max_retries_on_the_async_path(
+    method: str,
+) -> None:
+    """`aembed_*` bypassed the decorator the same way the sync methods did."""
+    import litellm
+
+    embeddings = LiteLLMEmbeddingsRouter(router=_one_deployment_router(), max_retries=4)
+
+    async def _raise(*args: Any, **kwargs: Any) -> Any:
+        raise litellm.RateLimitError(
+            message="rate limited", llm_provider="openai", model="x"
+        )
+
+    with (
+        patch.object(
+            embeddings.router, "aembedding", side_effect=_raise
+        ) as mock_embedding,
+        patch("asyncio.sleep", return_value=None),
+        pytest.raises(litellm.RateLimitError),
+    ):
+        await getattr(embeddings, method)(["hi"] if "documents" in method else "hi")
+
+    assert mock_embedding.call_count == 4
+
+
+@pytest.mark.parametrize(
+    "model_list",
+    [
+        [{"litellm_params": {"model": "openai/text-embedding-3-small"}}],
+        [{"model_name": None, "litellm_params": {}}],
+        ["not-a-dict"],
+    ],
+)
+def test_embeddings_router_falls_back_when_the_first_entry_has_no_alias(
+    model_list: Any,
+) -> None:
+    """A partial or stubbed model_list must leave the field default in place."""
+
+    class _Stub:
+        pass
+
+    stub = _Stub()
+    stub.model_list = model_list  # type: ignore[attr-defined]
+
+    embeddings = LiteLLMEmbeddingsRouter(router=stub)
+
+    assert embeddings.model == LiteLLMEmbeddingsRouter.model_fields["model"].default
+
+
+def test_embeddings_router_defaults_its_model_from_the_router() -> None:
+    """ChatLiteLLMRouter does this; the embeddings router left `model` unset."""
+    embeddings = LiteLLMEmbeddingsRouter(router=_one_deployment_router())
+    assert embeddings.model == "emb-small"
+
+
+def test_embeddings_router_keeps_a_model_kwargs_api_key() -> None:
+    """`model_kwargs` is where the class tells rejected credentials to go.
+
+    An unset field must not clobber the key supplied there and then vanish in
+    the None filter.
+    """
+
+    class _Response:
+        data: ClassVar[list[dict[str, list[float]]]] = [{"embedding": [0.1]}]
+
+    captured: dict = {}
+
+    def _capture(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return _Response()
+
+    embeddings = LiteLLMEmbeddingsRouter(
+        router=_one_deployment_router(), model_kwargs={"api_key": "sk-caller"}
+    )
+    with patch.object(embeddings.router, "embedding", side_effect=_capture):
+        embeddings.embed_query("hi")
+
+    assert captured["api_key"] == "sk-caller"
+
+
+def test_embeddings_router_forwards_only_an_explicit_api_key() -> None:
+    """Each deployment owns its endpoint, so the connector's must not override it."""
+
+    class _Response:
+        data: ClassVar[list[dict[str, list[float]]]] = [{"embedding": [0.1]}]
+
+    captured: dict = {}
+
+    def _capture(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return _Response()
+
+    embeddings = LiteLLMEmbeddingsRouter(
+        router=_one_deployment_router(),
+        api_key="sk-explicit",
+    )
+    with patch.object(embeddings.router, "embedding", side_effect=_capture):
+        embeddings.embed_query("hi")
+
+    assert captured["api_key"] == "sk-explicit"

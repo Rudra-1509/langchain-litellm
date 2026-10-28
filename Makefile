@@ -1,4 +1,6 @@
-.PHONY: all format lint test tests integration_tests docker_tests help extended_tests
+.PHONY: all help format format_diff lint lint_diff lint_package lint_tests \
+	test tests test_watch integration_test integration_tests \
+	spell_check spell_fix check_imports
 
 # Default target executed when no arguments are given to make.
 all: help
@@ -27,7 +29,7 @@ integration_test integration_tests:
 PYTHON_FILES=.
 MYPY_CACHE=.mypy_cache
 lint format: PYTHON_FILES=.
-lint_diff format_diff: PYTHON_FILES=$(shell git diff --relative=libs/partners/litellm --name-only --diff-filter=d master | grep -E '\.py$$|\.ipynb$$')
+lint_diff format_diff: PYTHON_FILES=$(shell git diff --name-only --diff-filter=d main | grep -E '\.py$$|\.ipynb$$')
 lint_package: PYTHON_FILES=langchain_litellm
 lint_tests: PYTHON_FILES=tests
 lint_tests: MYPY_CACHE=.mypy_cache_test
@@ -35,11 +37,11 @@ lint_tests: MYPY_CACHE=.mypy_cache_test
 lint lint_diff lint_package lint_tests:
 	[ "$(PYTHON_FILES)" = "" ] || uv run --group lint ruff check $(PYTHON_FILES)
 	[ "$(PYTHON_FILES)" = "" ] || uv run --group lint ruff format $(PYTHON_FILES) --diff
-	[ "$(PYTHON_FILES)" = "" ] || mkdir -p $(MYPY_CACHE) && uv run --group typing mypy $(PYTHON_FILES) --cache-dir $(MYPY_CACHE)
+	[ "$(PYTHON_FILES)" = "" ] || { mkdir -p $(MYPY_CACHE) && uv run --group typing mypy $(PYTHON_FILES) --cache-dir $(MYPY_CACHE); }
 
 format format_diff:
+	[ "$(PYTHON_FILES)" = "" ] || uv run --group lint ruff check --fix --exit-zero $(PYTHON_FILES)
 	[ "$(PYTHON_FILES)" = "" ] || uv run --group lint ruff format $(PYTHON_FILES)
-	[ "$(PYTHON_FILES)" = "" ] || uv run --group lint ruff check --select I --fix $(PYTHON_FILES)
 
 spell_check:
 	uv run --group codespell codespell --toml pyproject.toml

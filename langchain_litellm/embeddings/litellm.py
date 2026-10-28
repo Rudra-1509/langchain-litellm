@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+from collections.abc import Callable
+from typing import Any, Literal
 
 from langchain_core.embeddings import Embeddings
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -61,69 +62,115 @@ class LiteLLMEmbeddings(BaseModel, Embeddings):
     """Model name in litellm format (e.g. 'openai/text-embedding-3-small',
     'cohere/embed-english-v3.0', 'bedrock/amazon.titan-embed-text-v1')."""
 
-    api_key: Optional[str] = None
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    """Reject unknown constructor kwargs, naming them without echoing their values.
+
+    Provider-scoped names such as ``openai_api_key`` are not fields here, and
+    silently dropping a credential the caller believes is set is worse than
+    failing. Pass provider-specific values through ``model_kwargs``. Pydantic
+    reports the offending input alongside the error, so a rejected credential
+    would otherwise reach the traceback this class keeps it out of.
+    """
+
+    api_key: str | None = Field(default=None, repr=False)
     """API key for the provider."""
 
-    api_base: Optional[str] = None
-    """Base URL for the API endpoint."""
+    api_base: str | None = None
+    """Base URL for the API endpoint.
 
-    api_version: Optional[str] = None
+    Also accepts ``base_url`` as an alias, read at construction only. A non-None
+    ``api_base`` wins; ``base_url`` fills in when ``api_base`` is unset or None, so
+    a config built from ``os.getenv`` still reaches the endpoint."""
+
+    api_version: str | None = None
     """API version (e.g. for Azure)."""
 
-    custom_llm_provider: Optional[str] = None
+    custom_llm_provider: str | None = None
     """Override the litellm provider routing."""
 
-    organization: Optional[str] = None
+    organization: str | None = None
     """Organization ID (e.g. for OpenAI)."""
 
-    request_timeout: Optional[Union[float, Tuple[float, float]]] = None
+    request_timeout: float | tuple[float, float] | None = None
     """Timeout for API requests."""
 
     max_retries: int = 1
     """Maximum number of retries on transient errors (Timeout, APIError,
     APIConnectionError, RateLimitError)."""
 
-    extra_headers: Optional[Dict[str, str]] = None
+    extra_headers: dict[str, str] | None = Field(default=None, repr=False)
     """Extra headers to include in the request."""
 
-    model_kwargs: Dict[str, Any] = Field(default_factory=dict)
+    model_kwargs: dict[str, Any] = Field(default_factory=dict)
     """Additional model parameters passed to litellm.embedding()."""
 
-    dimensions: Optional[int] = None
+    dimensions: int | None = None
     """Output embedding dimensions (if supported by the model)."""
 
-    encoding_format: Optional[Literal["float"]] = None
+    encoding_format: Literal["float"] | None = None
     """Encoding format for the embeddings. Only 'float' is supported;
     'base64' is not supported as it would return strings instead of floats."""
 
-    document_input_type: Optional[str] = None
+    document_input_type: str | None = None
     """Input type to send when embedding documents (e.g. 'search_document'
     for Cohere, 'RETRIEVAL_DOCUMENT' for Vertex AI). When set,
     ``embed_documents`` passes this as ``input_type``."""
 
-    query_input_type: Optional[str] = None
+    query_input_type: str | None = None
     """Input type to send when embedding queries (e.g. 'search_query'
     for Cohere, 'RETRIEVAL_QUERY' for Vertex AI). When set,
     ``embed_query`` passes this as ``input_type``."""
 
-    def _get_litellm_params(
-        self, *, input_type: Optional[str] = None
-    ) -> Dict[str, Any]:
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_base_url_alias(cls, values: Any) -> Any:
+        """Accept base_url as a runtime alias for api_base.
+
+        Keyed on the VALUE, not key presence: ``api_base=None`` is the field's
+        own default, so treating it as "supplied" would silently drop base_url
+        for every config assembled from ``os.getenv``.
+        """
+        if not isinstance(values, dict):
+            return values
+
+        # Copy before popping: the caller still owns the dict they passed.
+        values = dict(values)
+        base_url = values.pop("base_url", None)
+        if base_url is not None and values.get("api_base") is None:
+            values["api_base"] = base_url
+
+        # Name the rejected keys, never their values: pydantic's own
+        # extra_forbidden error carries input_value into the traceback.
+        unknown = sorted(set(values) - set(cls.model_fields))
+        if unknown:
+            raise ValueError(
+                f"Unexpected keyword arguments: {', '.join(unknown)}. "
+                "Pass provider-specific values through model_kwargs."
+            )
+        return values
+
+    def _get_litellm_params(self, *, input_type: str | None = None) -> dict[str, Any]:
         """Build parameter dict for litellm.embedding(), excluding None values."""
-        params: Dict[str, Any] = {
-            **self.model_kwargs,
-            "model": self.model,
-            "api_key": self.api_key,
-            "api_base": self.api_base,
-            "api_version": self.api_version,
-            "custom_llm_provider": self.custom_llm_provider,
-            "organization": self.organization,
-            "timeout": self.request_timeout,
-            "extra_headers": self.extra_headers,
-            "dimensions": self.dimensions,
-            "encoding_format": self.encoding_format,
-            "input_type": input_type,
-        }
+        # An unset field must not clobber the same key supplied through
+        # model_kwargs, which is where this class sends provider-specific values.
+        params: dict[str, Any] = {**self.model_kwargs}
+        params.update(
+            (key, value)
+            for key, value in (
+                ("model", self.model),
+                ("api_key", self.api_key),
+                ("api_base", self.api_base),
+                ("api_version", self.api_version),
+                ("custom_llm_provider", self.custom_llm_provider),
+                ("organization", self.organization),
+                ("timeout", self.request_timeout),
+                ("extra_headers", self.extra_headers),
+                ("dimensions", self.dimensions),
+                ("encoding_format", self.encoding_format),
+                ("input_type", input_type),
+            )
+            if value is not None
+        )
         return {k: v for k, v in params.items() if v is not None}
 
     def _embedding_with_retry(self, **kwargs: Any) -> Any:
@@ -150,7 +197,7 @@ class LiteLLMEmbeddings(BaseModel, Embeddings):
 
         return await _aembed()
 
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
         """Embed a list of document texts.
 
         Args:
@@ -166,7 +213,7 @@ class LiteLLMEmbeddings(BaseModel, Embeddings):
         response = self._embedding_with_retry(input=texts, **params)
         return [item["embedding"] for item in response.data]
 
-    def embed_query(self, text: str) -> List[float]:
+    def embed_query(self, text: str) -> list[float]:
         """Embed a single query text.
 
         Args:
@@ -179,7 +226,7 @@ class LiteLLMEmbeddings(BaseModel, Embeddings):
         response = self._embedding_with_retry(input=[text], **params)
         return response.data[0]["embedding"]
 
-    async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
+    async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
         """Async embed a list of document texts.
 
         Args:
@@ -195,7 +242,7 @@ class LiteLLMEmbeddings(BaseModel, Embeddings):
         response = await self._aembedding_with_retry(input=texts, **params)
         return [item["embedding"] for item in response.data]
 
-    async def aembed_query(self, text: str) -> List[float]:
+    async def aembed_query(self, text: str) -> list[float]:
         """Async embed a single query text.
 
         Args:
