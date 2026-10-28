@@ -1390,11 +1390,10 @@ def _is_skipped_content_block(block: dict[str, Any]) -> bool:
 
 
 def _collapse_text_only_content(content: list[Any]) -> str | list[Any]:
-    """Collapse a text-only content list into a plain string.
+    """Join a list of bare strings into one string, else type each bare string.
 
-    If the content list contains only strings, joins them into a single string.
-    Otherwise, wraps bare strings as text blocks guarded by isinstance(item, str)
-    while preserving structured blocks and other non-dict items untouched.
+    A bare string is not a content part, so beside other items it goes out as a
+    text block; dicts and any other item pass through. An empty list joins to "".
     """
     if all(isinstance(item, str) for item in content):
         return "".join(content)
@@ -1462,7 +1461,7 @@ def _convert_message_to_dict(message: BaseMessage) -> dict[str, Any]:
         # Update content with the processed list.
         # If filtering removed all blocks, collapse to empty string so the
         # provider doesn't receive an empty list.
-        content = _collapse_text_only_content(new_content) if new_content else ""
+        content = _collapse_text_only_content(new_content)
 
     # Initialize the message dictionary with the processed content
     message_dict: dict[str, Any] = {"content": content}
